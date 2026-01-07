@@ -53,6 +53,7 @@ const toAdmissionDocument = (record: any, maps: RelatedMaps) => {
     treatment_given: record.treatment_given ?? '',
     after_effects: record.after_effects ?? '',
     dischargeDate: record.discharge_date,
+    rate_per_day: record.rate_per_day || null,
     createdAt: record.created_at,
     updatedAt: record.updated_at,
   };
@@ -133,6 +134,58 @@ router.get('/', authenticateToken, asyncHandler(async (req: AuthenticatedRequest
   });
 }));
 
+router.get('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const admissionId = req.params.id;
+
+  const { data, error } = await supabase
+    .from('admissions')
+    .select('*')
+    .eq('id', admissionId)
+    .maybeSingle();
+
+  if (error) {
+    logger.error('Failed to fetch admission', { admissionId, error });
+    throw createError('Failed to fetch admission', 500);
+  }
+
+  if (!data) {
+    throw createError('Admission not found', 404);
+  }
+
+  const patientIds = [data.patient_id].filter(Boolean);
+  const doctorIds = [data.doctor_id ?? data.admitted_by].filter(Boolean);
+  const roomIds = [data.room_id].filter(Boolean);
+
+  const [patientResponse, doctorResponse, roomResponse] = await Promise.all([
+    patientIds.length ? supabase.from('patients').select(PATIENT_FIELDS).in('id', patientIds) : Promise.resolve({ data: [], error: null }),
+    doctorIds.length ? supabase.from('staff').select(STAFF_FIELDS).in('id', doctorIds) : Promise.resolve({ data: [], error: null }),
+    roomIds.length ? supabase.from('rooms').select(ROOM_FIELDS).in('id', roomIds) : Promise.resolve({ data: [], error: null }),
+  ]);
+
+  if (patientResponse.error || doctorResponse.error || roomResponse.error) {
+    logger.error('Failed to resolve admission relationships', {
+      admissionId,
+      patientError: patientResponse.error,
+      doctorError: doctorResponse.error,
+      roomError: roomResponse.error,
+    });
+    throw createError('Failed to resolve admission data', 500);
+  }
+
+  const maps: RelatedMaps = {
+    patients: new Map((patientResponse.data ?? []).map((p) => [p.id, p])),
+    staff: new Map((doctorResponse.data ?? []).map((d) => [d.id, d])),
+    rooms: new Map((roomResponse.data ?? []).map((r) => [r.id, r])),
+  };
+
+  res.json({
+    success: true,
+    data: {
+      admission: toAdmissionDocument(data, maps),
+    },
+  });
+}));
+
 router.post('/', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const {
     patient_id,
@@ -158,6 +211,9 @@ router.post('/', authenticateToken, asyncHandler(async (req: AuthenticatedReques
   }
   const normalizedStatus = status.toLowerCase();
 
+  let roomType = 'general';
+  let roomDetails: { room_type?: string | null; occupied_beds?: number | null } | null = null;
+
   if (room_id) {
     const { data: roomActive } = await supabase
       .from('admissions')
@@ -169,6 +225,20 @@ router.post('/', authenticateToken, asyncHandler(async (req: AuthenticatedReques
     if (roomActive) {
       throw createError('Room already has an active admission', 400);
     }
+
+    const { data: roomDetailsData, error: roomDetailsError } = await supabase
+      .from('rooms')
+      .select('room_type, occupied_beds')
+      .eq('id', room_id)
+      .maybeSingle();
+
+    if (roomDetailsError) {
+      logger.error('Failed to fetch room details for admission creation', { room_id, error: roomDetailsError });
+      throw createError('Failed to fetch room details', 500);
+    }
+
+    roomDetails = roomDetailsData;
+    roomType = roomDetails?.room_type ?? roomType;
   }
 
   const admissionPayload = {
@@ -193,17 +263,21 @@ router.post('/', authenticateToken, asyncHandler(async (req: AuthenticatedReques
     .single();
 
   if (error || !data) {
+    logger.error('Admission creation failed', { payload: admissionPayload, error });
     throw createError('Failed to create admission', 500);
   }
 
   if (room_id) {
+    const roomUpdates: Record<string, unknown> = {
+      is_available: false,
+      current_patient_id: patient_id,
+      status: 'occupied',
+      occupied_beds: (roomDetails?.occupied_beds ?? 0) + 1,
+    };
+
     const { error: roomUpdateError } = await supabase
       .from('rooms')
-      .update({ 
-        is_available: false,
-        current_patient_id: patient_id,
-        status: 'occupied'
-      })
+      .update(roomUpdates)
       .eq('id', room_id);
 
     if (roomUpdateError) {
@@ -215,6 +289,22 @@ router.post('/', authenticateToken, asyncHandler(async (req: AuthenticatedReques
       patientId: patient_id,
       admissionId: data.id
     });
+  }
+
+  if (bed_id) {
+    const { error: bedUpdateError } = await supabase
+      .from('beds')
+      .update({
+        status: 'occupied',
+        current_patient_id: patient_id,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', bed_id);
+
+    if (bedUpdateError) {
+      logger.error('Failed to update bed assignment when creating admission', { bed_id, error: bedUpdateError });
+      throw createError('Failed to assign bed to patient', 500);
+    }
   }
 
   res.status(201).json({
@@ -365,24 +455,65 @@ router.put('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequ
 }));
 
 router.delete('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const admissionId = req.params.id;
+
   const { data: existing, error: fetchError } = await supabase
     .from('admissions')
-    .select('room_id')
-    .eq('id', req.params.id)
+    .select('room_id, bed_id')
+    .eq('id', admissionId)
     .maybeSingle();
 
   if (fetchError) {
+    logger.error('Failed to load admission before delete', { admissionId, error: fetchError });
     throw createError('Unable to fetch admission', 500);
   }
 
-  const { error } = await supabase.from('admissions').delete().eq('id', req.params.id);
+  if (!existing) {
+    throw createError('Admission not found', 404);
+  }
+
+  const deleteDependencies = async () => {
+    const { error: medsDeleteError } = await supabase
+      .from('patient_medications')
+      .delete()
+      .eq('admission_id', admissionId);
+
+    if (medsDeleteError) {
+      logger.error('Failed to delete admission medications before removal', {
+        admissionId,
+        error: medsDeleteError,
+      });
+      throw createError('Failed to delete admission medications', 500);
+    }
+
+    const { error: roomHistoryDeleteError } = await supabase
+      .from('room_history')
+      .delete()
+      .eq('admission_id', admissionId);
+
+    if (roomHistoryDeleteError) {
+      logger.error('Failed to delete room history before admission removal', {
+        admissionId,
+        error: roomHistoryDeleteError,
+      });
+      throw createError('Failed to delete admission room history', 500);
+    }
+  };
+
+  await deleteDependencies();
+
+  const { error } = await supabase.from('admissions').delete().eq('id', admissionId);
 
   if (error) {
+    logger.error('Failed to delete admission', { admissionId, error });
     throw createError('Failed to delete admission', 500);
   }
 
-  if (existing?.room_id) {
-    await supabase.from('rooms').update({ is_available: true }).eq('id', existing.room_id);
+  if (existing.room_id) {
+    await supabase
+      .from('rooms')
+      .update({ is_available: true, current_patient_id: null, status: 'available' })
+      .eq('id', existing.room_id);
   }
 
   res.json({ success: true });

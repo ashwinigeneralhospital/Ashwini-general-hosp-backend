@@ -140,7 +140,6 @@ const PATIENT_WITH_RELATIONS = `
       id,
       room_number,
       room_type,
-      rate_per_day,
       is_available
     )
   )

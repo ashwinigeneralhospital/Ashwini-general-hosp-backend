@@ -25,9 +25,14 @@ export const env = {
   NODE_ENV: process.env.NODE_ENV || 'development',
   JWT_SECRET: process.env.JWT_SECRET || 'your_jwt_secret_key',
   HOSPITAL_NAME: process.env.HOSPITAL_NAME || 'Ashwini General Hospital',
-  HOSPITAL_ADDRESS: process.env.HOSPITAL_ADDRESS || 'Your Hospital Address',
-  HOSPITAL_PHONE: process.env.HOSPITAL_PHONE || '+91-XXXXXXXXXX',
-  HOSPITAL_EMAIL: process.env.HOSPITAL_EMAIL || 'info@ashwinihospital.com',
+  HOSPITAL_ADDRESS: process.env.HOSPITAL_ADDRESS || 'Main Road, City - 411001',
+  HOSPITAL_PHONE: process.env.HOSPITAL_PHONE || '9096112500',
+  HOSPITAL_EMAIL: process.env.HOSPITAL_EMAIL || 'ashwinigeneralhospital2025@gmail.com',
+  HOSPITAL_LEAD_PHYSICIAN: process.env.HOSPITAL_LEAD_PHYSICIAN || 'DR.AASIYA JABEEN MD PHYSICIAN',
+  HOSPITAL_EMERGENCY_INFO: process.env.HOSPITAL_EMERGENCY_INFO || 'Emergency 24x7',
+  HOSPITAL_LOGO_PATH: process.env.HOSPITAL_LOGO_PATH || '',
+  HOSPITAL_LOGO_MIME: process.env.HOSPITAL_LOGO_MIME || 'image/jpeg',
+  HOSPITAL_LOGO_URL: process.env.HOSPITAL_LOGO_URL || 'https://pub-4ebb3a85771243cab7a77deb68bf9e9e.r2.dev/logo/PHOTO-2026-01-07-11-33-47.jpg',
   PORTAL_URL: process.env.PORTAL_URL || 'http://localhost:3000',
   
   // Seed Admin

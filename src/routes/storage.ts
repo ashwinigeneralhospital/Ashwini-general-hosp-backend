@@ -42,6 +42,8 @@ const normalizeKey = (value?: string | null) => {
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
+const ALLOWED_TYPES = ['aadhaar', 'pan', 'staff-photo', 'insurance-claim-doc'] as const;
+
 // Upload file to R2
 router.post('/upload', authenticateToken, upload.single('file'), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const file = req.file;
@@ -52,8 +54,8 @@ router.post('/upload', authenticateToken, upload.single('file'), asyncHandler(as
   }
 
   // Validate type
-  if (!['aadhaar', 'pan', 'staff-photo'].includes(type)) {
-    throw createError('Invalid file type. Must be aadhaar, pan, or staff-photo', 400);
+  if (!ALLOWED_TYPES.includes(type)) {
+    throw createError('Invalid file type. Must be aadhaar, pan, staff-photo, or insurance-claim-doc', 400);
   }
 
   // Generate unique key

@@ -12,6 +12,67 @@ const supabase = createClient(
 
 const MEDICATION_SELECT = '*';
 
+const refreshMedicationDoseStats = async (medicationId: string) => {
+  const { data: doses, error: dosesError } = await supabase
+    .from('patient_medication_doses')
+    .select('administered_at')
+    .eq('patient_medication_id', medicationId)
+    .order('administered_at', { ascending: true });
+
+  if (dosesError) {
+    logger.error('Failed to aggregate medication doses', {
+      medicationId,
+      error: dosesError.message,
+      details: dosesError.details,
+    });
+    throw createError('Failed to recalculate medication doses', 500);
+  }
+
+  const doseEntries = doses ?? [];
+  const dosesAdministered = doseEntries.length;
+  const lastAdministeredAt = doseEntries.length ? doseEntries[doseEntries.length - 1].administered_at : null;
+
+  const { data: medication, error: medicationError } = await supabase
+    .from('patient_medications')
+    .select('id, total_doses')
+    .eq('id', medicationId)
+    .single();
+
+  if (medicationError || !medication) {
+    throw createError('Medication not found', 404);
+  }
+
+  const updates: Record<string, unknown> = {
+    doses_administered: dosesAdministered,
+    last_administered_at: lastAdministeredAt,
+    updated_at: new Date().toISOString(),
+  };
+
+  if (medication.total_doses !== null && medication.total_doses !== undefined) {
+    if (dosesAdministered >= medication.total_doses) {
+      updates.billing_status = 'ready';
+    } else if (dosesAdministered > 0) {
+      updates.billing_status = 'in_progress';
+    } else {
+      updates.billing_status = 'pending';
+    }
+  }
+
+  const { data: updatedMedication, error: updateError } = await supabase
+    .from('patient_medications')
+    .update(updates)
+    .eq('id', medicationId)
+    .select(MEDICATION_SELECT)
+    .single();
+
+  if (updateError || !updatedMedication) {
+    logger.error('Failed to update medication after recalculating doses', { medicationId, error: updateError?.message });
+    throw createError('Failed to update medication after dosing', 500);
+  }
+
+  return updatedMedication;
+};
+
 // Get medications by patient ID with optional admission filter
 router.get('/patient/:patientId', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const { patientId } = req.params;
@@ -218,18 +279,7 @@ router.post('/:id/doses', authenticateToken, requireMedicalStaff, asyncHandler(a
   const { id } = req.params;
   const { units_administered, notes, administered_at } = req.body;
 
-  const { data: medication, error: medicationError } = await supabase
-    .from('patient_medications')
-    .select('id, doses_administered, total_doses')
-    .eq('id', id)
-    .single();
-
-  if (medicationError || !medication) {
-    throw createError('Medication not found', 404);
-  }
-
   const units = units_administered !== undefined ? Number(units_administered) : 1;
-  const nextDoseNumber = (medication.doses_administered ?? 0) + 1;
 
   const { data: dose, error: doseError } = await supabase
     .from('patient_medication_doses')
@@ -238,7 +288,6 @@ router.post('/:id/doses', authenticateToken, requireMedicalStaff, asyncHandler(a
       administered_by: req.user!.staff_id,
       administered_at: administered_at || new Date().toISOString(),
       units_administered: units,
-      dose_number: nextDoseNumber,
       notes: notes || null,
     })
     .select('*')
@@ -249,32 +298,99 @@ router.post('/:id/doses', authenticateToken, requireMedicalStaff, asyncHandler(a
     throw createError('Failed to log medication dose', 500);
   }
 
-  const updates: Record<string, unknown> = {
-    doses_administered: nextDoseNumber,
-    last_administered_at: dose.administered_at,
-    updated_at: new Date().toISOString(),
-  };
-
-  if (medication.total_doses && nextDoseNumber >= medication.total_doses) {
-    updates.billing_status = 'ready';
-  }
-
-  const { data: updatedMedication, error: updateError } = await supabase
-    .from('patient_medications')
-    .update(updates)
-    .eq('id', id)
-    .select(MEDICATION_SELECT)
-    .single();
-
-  if (updateError || !updatedMedication) {
-    logger.error('Failed to update medication after dosing', { medicationId: id, error: updateError?.message });
-    throw createError('Failed to update medication after dosing', 500);
-  }
+  const updatedMedication = await refreshMedicationDoseStats(id);
 
   res.status(201).json({
     success: true,
     data: {
       dose,
+      medication: updatedMedication,
+    },
+  });
+}));
+
+// Update an administered dose
+router.put('/doses/:doseId', authenticateToken, requireMedicalStaff, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const { doseId } = req.params;
+  const { units_administered, notes, administered_at } = req.body;
+
+  const { data: existingDose, error: existingDoseError } = await supabase
+    .from('patient_medication_doses')
+    .select('id, patient_medication_id')
+    .eq('id', doseId)
+    .single();
+
+  if (existingDoseError || !existingDose) {
+    throw createError('Dose not found', 404);
+  }
+
+  const updates: Record<string, unknown> = {
+    updated_at: new Date().toISOString(),
+  };
+
+  if (units_administered !== undefined) {
+    updates.units_administered = Number(units_administered);
+  }
+  if (notes !== undefined) {
+    updates.notes = notes;
+  }
+  if (administered_at !== undefined) {
+    updates.administered_at = administered_at;
+  }
+
+  const { data: updatedDose, error: updateError } = await supabase
+    .from('patient_medication_doses')
+    .update(updates)
+    .eq('id', doseId)
+    .select('*')
+    .single();
+
+  if (updateError || !updatedDose) {
+    logger.error('Failed to update medication dose', { doseId, error: updateError?.message });
+    throw createError('Failed to update medication dose', 500);
+  }
+
+  const updatedMedication = await refreshMedicationDoseStats(existingDose.patient_medication_id);
+
+  res.json({
+    success: true,
+    data: {
+      dose: updatedDose,
+      medication: updatedMedication,
+    },
+  });
+}));
+
+// Delete an administered dose
+router.delete('/doses/:doseId', authenticateToken, requireMedicalStaff, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const { doseId } = req.params;
+
+  const { data: existingDose, error: existingDoseError } = await supabase
+    .from('patient_medication_doses')
+    .select('id, patient_medication_id')
+    .eq('id', doseId)
+    .single();
+
+  if (existingDoseError || !existingDose) {
+    throw createError('Dose not found', 404);
+  }
+
+  const { error: deleteError } = await supabase
+    .from('patient_medication_doses')
+    .delete()
+    .eq('id', doseId);
+
+  if (deleteError) {
+    logger.error('Failed to delete medication dose', { doseId, error: deleteError.message });
+    throw createError('Failed to delete medication dose', 500);
+  }
+
+  const updatedMedication = await refreshMedicationDoseStats(existingDose.patient_medication_id);
+
+  res.json({
+    success: true,
+    data: {
+      deleted_dose_id: doseId,
       medication: updatedMedication,
     },
   });

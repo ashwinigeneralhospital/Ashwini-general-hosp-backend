@@ -30,8 +30,7 @@ const BED_SELECT = `
     bed_number,
     total_beds,
     occupied_beds,
-    status,
-    rate_per_day
+    status
   ),
   current_patient:patients!beds_current_patient_id_fkey (
     id,
@@ -44,8 +43,7 @@ const BED_SELECT = `
 `;
 
 const mapBed = (bed: any) => {
-  console.log('Mapping bed:', bed);
-  const result = {
+  return {
     id: bed.id,
     roomId: bed.room_id,
     roomNumber: bed.room?.room_number,
@@ -73,8 +71,6 @@ const mapBed = (bed: any) => {
     createdAt: bed.created_at,
     updatedAt: bed.updated_at,
   };
-  console.log('Mapped bed result:', result);
-  return result;
 };
 
 // Get all beds with room and patient information

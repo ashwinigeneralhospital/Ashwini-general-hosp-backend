@@ -120,6 +120,9 @@ export const sendStaffWelcomeEmail = async ({
           <table style="max-width:520px;margin:0 auto;background:#ffffff;border-radius:16px;padding:32px;border:1px solid #e5e7eb;">
             <tr>
               <td style="text-align:center;padding-bottom:16px;">
+                <div style="margin-bottom: 12px;">
+                  <img src="http://localhost:3000/logo.jpg" alt="Ashwini General Hospital" style="width: 60px; height: 60px; object-fit: contain;" />
+                </div>
                 <h2 style="margin:0;font-size:20px;color:#1f2937;">${env.HOSPITAL_NAME}</h2>
                 <p style="margin:4px 0 0;font-size:14px;color:#6b7280;">Staff Access Credentials</p>
               </td>

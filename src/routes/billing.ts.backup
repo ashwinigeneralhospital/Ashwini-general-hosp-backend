@@ -6,6 +6,7 @@ import { logger } from '../utils/logger.js';
 import { sendEmail } from '../utils/mailer.js';
 import { getHospitalLogoDataUri } from '../utils/logo.js';
 import { env } from '../config/env.js';
+import puppeteer from 'puppeteer';
 
 const router = Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -39,96 +40,6 @@ const BILL_ITEM_SELECT = `
   *
 `;
 
-const ADMISSION_BASE_FIELDS = `
-  id,
-  patient_id,
-  room_id,
-  bed_id,
-  doctor_id,
-  admission_date,
-  discharge_date,
-  status,
-  reason
-`;
-
-const fetchAdmissionWithRelations = async (admissionId: string) => {
-  const { data: admission, error } = await supabase
-    .from('admissions')
-    .select(ADMISSION_BASE_FIELDS)
-    .eq('id', admissionId)
-    .single();
-
-  if (error || !admission) {
-    logger.error('Admission lookup failed', { admissionId, error });
-    throw createError('Admission not found', 404);
-  }
-
-  const [
-    patientResult,
-    roomResult,
-    bedResult,
-    staffResult,
-  ] = await Promise.all([
-    admission.patient_id
-      ? supabase
-          .from('patients')
-          .select('id, patient_id, first_name, last_name, date_of_birth, phone, email, gender')
-          .eq('id', admission.patient_id)
-          .maybeSingle()
-      : Promise.resolve({ data: null, error: null }),
-    admission.room_id
-      ? supabase
-          .from('rooms')
-          .select('id, room_number, room_type, floor')
-          .eq('id', admission.room_id)
-          .maybeSingle()
-      : Promise.resolve({ data: null, error: null }),
-    admission.bed_id
-      ? supabase
-          .from('beds')
-          .select('id, bed_number, bed_label')
-          .eq('id', admission.bed_id)
-          .maybeSingle()
-      : Promise.resolve({ data: null, error: null }),
-    admission.doctor_id
-      ? supabase
-          .from('staff')
-          .select('id, first_name, last_name, role, employment_role, department')
-          .eq('id', admission.doctor_id)
-          .maybeSingle()
-      : Promise.resolve({ data: null, error: null }),
-  ]);
-
-  const logRelationError = (relation: string, relationError: any) => {
-    if (relationError) {
-      logger.warn(`Failed to fetch ${relation} for admission`, {
-        admissionId,
-        error: relationError.message,
-      });
-    }
-  };
-
-  logRelationError('patient', patientResult.error);
-  logRelationError('room', roomResult.error);
-  logRelationError('bed', bedResult.error);
-  logRelationError('staff', staffResult.error);
-
-  const staffData = staffResult.data
-    ? {
-        ...staffResult.data,
-        name: [staffResult.data.first_name, staffResult.data.last_name].filter(Boolean).join(' ').trim(),
-      }
-    : null;
-
-  return {
-    ...admission,
-    patients: patientResult.data ?? null,
-    rooms: roomResult.data ?? null,
-    beds: bedResult.data ?? null,
-    staff: staffData,
-  };
-};
-
 // Get all invoices
 router.get('/', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
@@ -158,62 +69,37 @@ router.get('/', authenticateToken, asyncHandler(async (req: AuthenticatedRequest
     throw createError('Failed to fetch invoices', 500);
   }
 
-  const invoiceList = invoices ?? [];
-  const admissionIds = Array.from(new Set(invoiceList.map((invoice) => invoice.admission_id).filter(Boolean)));
+  // Fetch related data for each invoice
+  const invoicesWithRelations = await Promise.all(
+    invoices.map(async (invoice) => {
+      const { data: admissionData } = await supabase
+        .from('admissions')
+        .select(`
+          *,
+          patients (
+            id,
+            patient_id,
+            first_name,
+            last_name,
+            phone,
+            email
+          ),
+          rooms (
+            id,
+            room_number,
+            room_type,
+            rate_per_day
+          )
+        `)
+        .eq('id', invoice.admission_id)
+        .single();
 
-  let admissionMap = new Map<string, any>();
-
-  if (admissionIds.length > 0) {
-    const { data: admissionsData, error: admissionsError } = await supabase
-      .from('admissions')
-      .select('id, admission_date, discharge_date, patient_id, room_id, bed_id, doctor_id')
-      .in('id', admissionIds);
-
-    if (admissionsError) {
-      logger.error('Failed to fetch admissions for invoices', { error: admissionsError });
-      throw createError('Failed to fetch invoices', 500);
-    }
-
-    const admissionsList = admissionsData ?? [];
-    const patientIds = Array.from(new Set(admissionsList.map((adm) => adm.patient_id).filter(Boolean)));
-    const roomIds = Array.from(new Set(admissionsList.map((adm) => adm.room_id).filter(Boolean)));
-
-    const [patientsResponse, roomsResponse] = await Promise.all([
-      patientIds.length
-        ? supabase.from('patients').select('id, patient_id, first_name, last_name, phone, email').in('id', patientIds)
-        : Promise.resolve({ data: [], error: null }),
-      roomIds.length
-        ? supabase.from('rooms').select('id, room_number, room_type').in('id', roomIds)
-        : Promise.resolve({ data: [], error: null }),
-    ]);
-
-    if (patientsResponse.error || roomsResponse.error) {
-      logger.error('Failed to fetch patient/room data for invoices', {
-        patientError: patientsResponse.error,
-        roomError: roomsResponse.error,
-      });
-      throw createError('Failed to fetch invoices', 500);
-    }
-
-    const patientMap = new Map((patientsResponse.data ?? []).map((patient) => [patient.id, patient]));
-    const roomMap = new Map((roomsResponse.data ?? []).map((room) => [room.id, room]));
-
-    admissionMap = new Map(
-      admissionsList.map((admission) => [
-        admission.id,
-        {
-          ...admission,
-          patients: admission.patient_id ? patientMap.get(admission.patient_id) ?? null : null,
-          rooms: admission.room_id ? roomMap.get(admission.room_id) ?? null : null,
-        },
-      ]),
-    );
-  }
-
-  const invoicesWithRelations = invoiceList.map((invoice) => ({
-    ...invoice,
-    admissions: invoice.admission_id ? admissionMap.get(invoice.admission_id) ?? null : null,
-  }));
+      return {
+        ...invoice,
+        admissions: admissionData
+      };
+    })
+  );
 
   res.json({
     success: true,
@@ -495,7 +381,36 @@ router.post('/', authenticateToken, requireBilling, asyncHandler(async (req: Aut
     throw createError('Failed to create invoice', 500);
   }
 
-  const admissionData = await fetchAdmissionWithRelations(admission_id);
+  // Fetch related admission and patient data manually
+  const { data: admissionData } = await supabase
+    .from('admissions')
+    .select(`
+      *,
+      patients (
+        id,
+        patient_id,
+        first_name,
+        last_name,
+        date_of_birth,
+        phone,
+        email
+      ),
+      rooms (
+        id,
+        room_number,
+        room_type,
+        rate_per_day
+      ),
+      staff (
+        id,
+        name,
+        role,
+        employment_role,
+        department
+      )
+    `)
+    .eq('id', admission_id)
+    .single();
 
   // Combine the data
   const invoiceWithRelations = {
@@ -539,7 +454,36 @@ router.put('/:id', authenticateToken, requireBilling, asyncHandler(async (req: A
     throw createError('Invoice not found or update failed', 404);
   }
 
-  const admissionData = await fetchAdmissionWithRelations(updatedInvoice.admission_id);
+  // Fetch related admission and patient data manually
+  const { data: admissionData } = await supabase
+    .from('admissions')
+    .select(`
+      *,
+      patients (
+        id,
+        patient_id,
+        first_name,
+        last_name,
+        date_of_birth,
+        phone,
+        email
+      ),
+      rooms (
+        id,
+        room_number,
+        room_type,
+        rate_per_day
+      ),
+      staff (
+        id,
+        name,
+        role,
+        employment_role,
+        department
+      )
+    `)
+    .eq('id', updatedInvoice.admission_id)
+    .single();
 
   // Combine the data
   const invoiceWithRelations = {
@@ -585,186 +529,6 @@ router.delete('/:id', authenticateToken, requireBilling, asyncHandler(async (req
 
 // Get invoice with bill items
 router.get('/:id/details', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-
-// Generate PDF invoice using PDFKit
-router.get("/:id/pdf", authenticateToken, requireBilling, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const { id } = req.params;
-
-  logger.info("Generating PDF for invoice", { invoiceId: id });
-
-  const { data: invoice, error: invoiceError } = await supabase
-    .from("invoices")
-    .select("*")
-    .eq("id", id)
-    .single();
-
-  if (invoiceError || !invoice) {
-    logger.error("Invoice not found", { invoiceId: id, error: invoiceError });
-    throw createError("Invoice not found", 404);
-  }
-
-  let admissionData = null;
-  try {
-    admissionData = await fetchAdmissionWithRelations(invoice.admission_id);
-  } catch (admissionError: any) {
-    logger.error("Admission data not found", { invoiceId: id, error: admissionError?.message });
-    throw createError("Admission data not found for invoice", 404);
-  }
-
-  // Debug logging for admission data
-  logger.info('Admission Data Debug', {
-    invoiceId: id,
-    admissionId: invoice.admission_id,
-    admissionData,
-    hasBeds: !!admissionData?.beds,
-    hasRooms: !!admissionData?.rooms,
-    bedId: admissionData?.bed_id,
-    roomId: admissionData?.room_id,
-    doctorId: admissionData?.doctor_id,
-    bedsData: admissionData?.beds,
-    roomsData: admissionData?.rooms
-  });
-
-  let staffName = "Unknown Doctor";
-  if (admissionData?.doctor_id) {
-    logger.info('Fetching staff data', { doctorId: admissionData.doctor_id });
-    const { data: staff, error: staffError } = await supabase
-      .from("staff")
-      .select("first_name, last_name")
-      .eq("id", admissionData.doctor_id)
-      .single();
-
-    if (staffError) {
-      logger.error("Staff fetch error", { doctorId: admissionData.doctor_id, error: staffError });
-    } else if (staff) {
-      staffName = `${staff.first_name} ${staff.last_name}`;
-      logger.info('Staff data found', { staffName, staff });
-    } else {
-      logger.warn('Staff not found', { doctorId: admissionData.doctor_id });
-    }
-  } else {
-    logger.warn('No doctor_id in admission data', { admissionData });
-  }
-
-  // Calculate room charges based on admission duration and room type
-  const calculateRoomCharges = (admission: any) => {
-    const admissionDate = new Date(admission.admission_date);
-    const dischargeDate = admission.discharge_date ? new Date(admission.discharge_date) : new Date();
-    const totalDays = Math.ceil((dischargeDate.getTime() - admissionDate.getTime()) / (1000 * 60 * 60 * 24));
-    
-    // Default room rates (can be fetched from database room rates)
-    const roomRates = {
-      'icu': 5000,
-      'private': 3000,
-      'general': 1500,
-      'semi-private': 2000
-    };
-    
-    // Get current room rate
-    const roomType = (admission.rooms?.room_type as string)?.toLowerCase() || 'general';
-    const currentRoomRate = admission.rooms?.rate_per_day || roomRates[roomType as keyof typeof roomRates] || roomRates.general;
-    
-    // For now, calculate based on current room type for entire stay
-    // TODO: Implement room history tracking for multiple room types
-    const totalRoomCharges = totalDays * currentRoomRate;
-    
-    logger.info('Room charges calculated', {
-      admissionId: admission.id,
-      totalDays,
-      roomType: admission.rooms?.room_type,
-      ratePerDay: currentRoomRate,
-      totalCharges: totalRoomCharges,
-      admissionDate: admission.admission_date,
-      dischargeDate: admission.discharge_date
-    });
-    
-    return {
-      totalDays,
-      roomType: admission.rooms?.room_type || 'general',
-      ratePerDay: currentRoomRate,
-      totalCharges: totalRoomCharges,
-      breakdown: [{
-        roomType: admission.rooms?.room_type || 'general',
-        days: totalDays,
-        ratePerDay: currentRoomRate,
-        charges: totalRoomCharges
-      }]
-    };
-  };
-
-  const roomCharges = calculateRoomCharges(admissionData);
-
-  const invoiceWithRelations = {
-    ...invoice,
-    admissions: admissionData
-      ? {
-          ...admissionData,
-          staff: admissionData.doctor_id
-            ? { id: admissionData.doctor_id, name: staffName }
-            : null,
-        }
-      : null,
-  };
-
-  const { data: billItems, error: billItemsError } = await supabase
-    .from("bill_items")
-    .select("*")
-    .eq("invoice_id", id);
-
-  // Add room charges to bill items if not already present
-  let finalBillItems = billItems || [];
-  const hasRoomCharges = finalBillItems.some(item => 
-    item.item_name?.toLowerCase().includes('room') || 
-    item.description?.toLowerCase().includes('room')
-  );
-
-  if (!hasRoomCharges && roomCharges.totalCharges > 0) {
-    const roomChargeItem = {
-      id: `room-charge-${admissionData.id}`,
-      invoice_id: id,
-      item_name: `Room Charges - ${roomCharges.roomType.charAt(0).toUpperCase() + roomCharges.roomType.slice(1)} Room`,
-      description: `${roomCharges.totalDays} days @ ${roomCharges.ratePerDay}/day`,
-      quantity: roomCharges.totalDays,
-      unit_price: roomCharges.ratePerDay,
-      amount: roomCharges.totalCharges,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    };
-    
-    finalBillItems.push(roomChargeItem);
-    logger.info('Room charges added to bill items', { roomChargeItem });
-  }
-
-  if (billItemsError) {
-    logger.error("Failed to fetch bill items", { invoiceId: id, error: billItemsError });
-    throw createError("Failed to fetch bill items", 500);
-  }
-
-  try {
-    const { generateInvoicePDF } = await import("../utils/pdf-generator.js");
-    const pdfBuffer = await generateInvoicePDF({
-      invoice: invoiceWithRelations,
-      billItems: finalBillItems,
-      patientName: `${invoiceWithRelations.admissions?.patients?.first_name || ""} ${invoiceWithRelations.admissions?.patients?.last_name || ""}`.trim(),
-      doctorName: staffName,
-    });
-
-    logger.info("PDF generated successfully", {
-      invoiceId: id,
-      fileSize: pdfBuffer.length,
-      invoiceNumber: invoice.invoice_number,
-    });
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="invoice-${invoice.invoice_number}.pdf"`);
-    res.setHeader("Content-Length", pdfBuffer.length);
-
-    res.send(pdfBuffer);
-  } catch (error) {
-    logger.error("PDF generation failed", { invoiceId: id, error });
-    throw createError("Failed to generate PDF", 500);
-  }
-}));
   const { id } = req.params;
 
   const { data: invoice, error: invoiceError } = await supabase
@@ -783,48 +547,101 @@ router.get("/:id/pdf", authenticateToken, requireBilling, asyncHandler(async (re
   });
 
   // Fetch related admission and patient data manually
-  try {
-    const admissionData = await fetchAdmissionWithRelations(invoice.admission_id);
-    logger.info('Admission data fetched', {
-      invoiceId: id,
-      admissionFound: !!admissionData,
-      patientFound: !!admissionData?.patients,
-      doctorId: admissionData?.doctor_id,
-      admissionData: admissionData ? {
-        id: admissionData.id,
-        doctor_id: admissionData.doctor_id,
-        hasDoctorId: !!admissionData.doctor_id
-      } : null
-    });
+  const { data: admissionData, error: admissionError } = await supabase
+    .from('admissions')
+    .select(`
+      *,
+      patients (
+        id,
+        patient_id,
+        first_name,
+        last_name,
+        date_of_birth,
+        phone,
+        email
+      ),
+      rooms (
+        id,
+        room_number,
+        room_type,
+        rate_per_day
+      )
+    `)
+    .eq('id', invoice.admission_id)
+    .single();
 
-    const { data: billItems, error: itemsError } = await supabase
-      .from('bill_items')
-      .select(BILL_ITEM_SELECT)
-      .eq('invoice_id', id)
-      .order('created_at', { ascending: true });
-
-    if (itemsError) {
-      throw createError('Failed to fetch bill items', 500);
+  // Try to fetch staff data separately if admission exists
+  let staffData = null;
+  if (admissionData && admissionData.doctor_id) {
+    const { data: staff, error: staffError } = await supabase
+      .from('staff')
+      .select('id, first_name, last_name, role, employment_role, department')
+      .eq('id', admissionData.doctor_id)
+      .single();
+    
+    if (!staffError && staff) {
+      staffData = {
+        ...staff,
+        name: `${staff.first_name} ${staff.last_name}`
+      };
+      logger.info('Staff data fetched', {
+        invoiceId: id,
+        staffId: staff.id,
+        staffName: staffData.name
+      });
+    } else {
+      logger.warn('Staff data not found', {
+        invoiceId: id,
+        doctorId: admissionData.doctor_id,
+        error: staffError?.message
+      });
     }
+  }
 
-    const invoiceWithRelations = {
-      ...invoice,
-      admissions: admissionData,
-      billItems: billItems || [],
-    };
-
-    res.json({
-      success: true,
-      data: invoiceWithRelations,
-    });
-  } catch (fetchError: any) {
-    logger.error('Failed to fetch admission data for invoice details', {
+  if (admissionError) {
+    logger.error('Failed to fetch admission data', {
       invoiceId: id,
       admissionId: invoice.admission_id,
-      error: fetchError?.message,
+      error: admissionError.message
     });
-    throw createError('Failed to fetch admission data', 500);
   }
+
+  logger.info('Admission data fetched', {
+    invoiceId: id,
+    admissionFound: !!admissionData,
+    patientFound: !!admissionData?.patients,
+    doctorId: admissionData?.doctor_id,
+    admissionData: admissionData ? {
+      id: admissionData.id,
+      doctor_id: admissionData.doctor_id,
+      hasDoctorId: !!admissionData.doctor_id
+    } : null
+  });
+
+  const { data: billItems, error: itemsError } = await supabase
+    .from('bill_items')
+    .select(BILL_ITEM_SELECT)
+    .eq('invoice_id', id)
+    .order('created_at', { ascending: true });
+
+  if (itemsError) {
+    throw createError('Failed to fetch bill items', 500);
+  }
+
+  // Combine the data
+  const invoiceWithRelations = {
+    ...invoice,
+    admissions: {
+      ...admissionData,
+      staff: staffData
+    },
+    billItems: billItems || []
+  };
+
+  res.json({
+    success: true,
+    data: invoiceWithRelations
+  });
 }));
 
 // Get room usage charges for admission
@@ -893,74 +710,65 @@ router.post('/comprehensive', authenticateToken, requireBilling, asyncHandler(as
     throw createError('admission_id is required', 400);
   }
 
-  const fetchAdmission = (column: 'id' | 'admission_code', value: string) =>
-    supabase
-      .from('admissions')
-      .select('*')
-      .eq(column, value)
-      .maybeSingle();
+  // Start transaction
+  const { data: admission, error: admissionError } = await supabase
+    .from('admissions')
+    .select(`
+      *,
+      patients (
+        id,
+        patient_id,
+        first_name,
+        last_name,
+        date_of_birth,
+        phone,
+        email
+      ),
+      rooms (
+        id,
+        room_number,
+        room_type,
+        rate_per_day
+      ),
+      staff (
+        id,
+        name,
+        role,
+        employment_role,
+        department
+      )
+    `)
+    .eq('id', admission_id)
+    .single();
 
-  let admissionResult = await fetchAdmission('id', admission_id);
-  if ((admissionResult.error && admissionResult.error.code !== 'PGRST116') || !admissionResult.data) {
-    logger.warn('Admission lookup by ID failed, attempting fallback to admission_code', {
-      admission_id,
-      error: admissionResult.error?.message,
-    });
-    admissionResult = await fetchAdmission('admission_code', admission_id);
-  }
-
-  if (admissionResult.error || !admissionResult.data) {
-    logger.error('Admission lookup failed for invoice generation', {
-      admission_id,
-      error: admissionResult.error?.message,
-    });
+  if (admissionError || !admission) {
     throw createError('Admission not found', 404);
   }
-
-  const admission = admissionResult.data;
 
   let totalAmount = 0;
   const invoiceItems: any[] = [];
 
-  // Add room charges if requested (using bed-specific pricing from room_history)
+  // Add room charges if requested
   if (include_room_charges) {
-    const { data: roomChargesResult, error: roomChargesError } = await supabase
-      .rpc('calculate_room_charges', { p_admission_id: admission_id });
+    const { data: roomCharges } = await supabase
+      .rpc('calculate_room_usage_billing', { p_admission_id: admission_id });
 
-    if (roomChargesError) {
-      logger.warn('Failed to calculate room charges from room_history', { 
-        admission_id, 
-        error: roomChargesError.message 
+    if (roomCharges && roomCharges.length > 0) {
+      const roomCharge = roomCharges[0];
+      const roomTotal = Number(roomCharge.total_amount || 0);
+      totalAmount += roomTotal;
+      
+      invoiceItems.push({
+        item_type: 'room',
+        item_name: `Room ${roomCharge.room_name} - ${roomCharge.bed_label}`,
+        item_description: `Room charges from ${new Date(roomCharge.start_date).toLocaleDateString()} to ${new Date(roomCharge.end_date).toLocaleDateString()}`,
+        quantity: Number(roomCharge.total_days || 0),
+        unit_price: Number(roomCharge.daily_rate || 0),
+        total_price: roomTotal,
+        date_from: roomCharge.start_date,
+        date_to: roomCharge.end_date,
+        reference_id: admission.room_id
       });
-    } else if (roomChargesResult && roomChargesResult.length > 0) {
-      const chargesSummary = roomChargesResult[0];
-      const totalCharges = Number(chargesSummary.total_charges || 0);
-      const breakdown = chargesSummary.breakdown || [];
-
-      if (totalCharges > 0 && Array.isArray(breakdown) && breakdown.length > 0) {
-        totalAmount += totalCharges;
-
-        // Add individual breakdown items as separate line items
-        breakdown.forEach((entry: any) => {
-          const entryCharges = Number(entry.charges || 0);
-          const entryDays = Number(entry.days || 0);
-          const entryRate = Number(entry.rate_per_day || 0);
-
-          if (entryCharges > 0) {
-            invoiceItems.push({
-              item_type: 'room',
-              item_name: `Room/Bed - ${entry.room_type || 'N/A'}`,
-              item_description: `Charges from ${new Date(entry.start_date).toLocaleDateString()} to ${entry.end_date ? new Date(entry.end_date).toLocaleDateString() : 'Present'}`,
-              quantity: entryDays,
-              unit_price: entryRate,
-              total_price: entryCharges,
-              date_from: entry.start_date,
-              date_to: entry.end_date,
-              reference_id: admission.room_id
-            });
-          }
-        });
-      }
     }
   }
 
@@ -1175,86 +983,6 @@ router.post('/:id/items', authenticateToken, requireBilling, asyncHandler(async 
   res.status(201).json({
     success: true,
     data: { billItem }
-  });
-}));
-
-// Update invoice payment status & financial details
-router.patch('/:id/status', authenticateToken, requireBilling, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const {
-    status,
-    amount_paid,
-    paid_amount,
-    include_gst,
-    gst_rate,
-    gst_amount,
-    total_with_gst,
-    payment_method,
-    payment_reference,
-    payment_notes,
-    discount_type,
-    discount_value,
-    discount_reason,
-    last_payment_date,
-  } = req.body;
-
-  const { id } = req.params;
-  const paidAmountValue = paid_amount ?? amount_paid;
-
-  if (!status) {
-    throw createError('status is required', 400);
-  }
-
-  const updateData: Record<string, any> = {
-    status,
-    updated_at: new Date().toISOString(),
-  };
-
-  if (paidAmountValue !== undefined) {
-    updateData.paid_amount = Number(paidAmountValue);
-    updateData.last_payment_date = last_payment_date ?? new Date().toISOString();
-  }
-
-  if (include_gst !== undefined) updateData.include_gst = Boolean(include_gst);
-  if (gst_rate !== undefined) updateData.gst_rate = Number(gst_rate);
-  if (gst_amount !== undefined) updateData.gst_amount = Number(gst_amount);
-  if (total_with_gst !== undefined) updateData.total_with_gst = Number(total_with_gst);
-
-  if (payment_method !== undefined) updateData.payment_method = payment_method || null;
-  if (payment_reference !== undefined) updateData.payment_reference = payment_reference || null;
-  if (payment_notes !== undefined) updateData.payment_notes = payment_notes || null;
-
-  if (discount_type !== undefined) {
-    updateData.discount_type = discount_type === 'none' ? null : discount_type;
-  }
-  if (discount_value !== undefined) updateData.discount_value = discount_value !== null ? Number(discount_value) : null;
-  if (discount_reason !== undefined) updateData.discount_reason = discount_reason || null;
-
-  const { data: updatedInvoice, error } = await supabase
-    .from('invoices')
-    .update(updateData)
-    .eq('id', id)
-    .select('*')
-    .single();
-
-  if (error || !updatedInvoice) {
-    throw createError('Invoice not found or update failed', 404);
-  }
-
-  logger.info('Invoice payment status updated', {
-    invoiceId: id,
-    status,
-    paid_amount: paidAmountValue,
-    include_gst: updateData.include_gst,
-    discount_type: updateData.discount_type,
-    discount_value: updateData.discount_value,
-    payment_method: updateData.payment_method,
-    updatedBy: req.user?.id,
-  });
-
-  res.json({
-    success: true,
-    message: 'Payment status updated successfully',
-    data: updatedInvoice,
   });
 }));
 
@@ -1513,31 +1241,21 @@ const generateInvoiceHTML = (invoice: any, billItems: any[]) => {
           width: 100%;
           border-collapse: collapse;
           margin: 10px 0;
-          font-size: 9.5px;
-          table-layout: fixed;
+          font-size: 9px;
         }
         .detailed-breakup th,
         .detailed-breakup td {
           border: 1px solid #000;
-          padding: 4px;
+          padding: 3px;
           text-align: left;
-          vertical-align: top;
-          word-break: break-word;
         }
         .detailed-breakup th {
           background-color: #f0f0f0;
           font-weight: bold;
         }
-        .detailed-breakup th:nth-child(1) {
-          width: 60px;
-        }
-        .detailed-breakup th:nth-child(2) {
-          width: 120px;
-        }
         .detailed-breakup .amount-col {
           text-align: right;
-          width: 80px;
-          white-space: nowrap;
+          width: 60px;
         }
         .billing-details {
           text-align: center;
@@ -1650,7 +1368,7 @@ const generateInvoiceHTML = (invoice: any, billItems: any[]) => {
           ${billItems.map(item => `
             <tr>
               <td>${item.medical_code || 'N/A'}</td>
-              <td>${new Date(item.created_at).toLocaleDateString('en-GB')}</td>
+              <td>${new Date(item.created_at).toLocaleDateString('en-GB')} ${new Date(item.created_at).toLocaleTimeString()}</td>
               <td>${item.item_name}</td>
               <td class="amount-col">${Number(item.unit_price).toFixed(2)}</td>
               <td class="amount-col">${item.quantity}</td>
@@ -1666,7 +1384,7 @@ const generateInvoiceHTML = (invoice: any, billItems: any[]) => {
   `;
 };
 
-// Send invoice via email with PDF attachment
+// Send invoice via email
 router.post('/:id/send-email', authenticateToken, requireBilling, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const { email, subject, message } = req.body;
@@ -1681,180 +1399,107 @@ router.post('/:id/send-email', authenticateToken, requireBilling, asyncHandler(a
     throw createError('Invoice not found', 404);
   }
 
-  let admissionData = null;
-  try {
-    admissionData = await fetchAdmissionWithRelations(invoice.admission_id);
-  } catch (admissionError: any) {
-    logger.error('Admission lookup failed for invoice email', { invoiceId: id, error: admissionError?.message });
+  // Fetch related admission and patient data manually
+  const { data: admissionData } = await supabase
+    .from('admissions')
+    .select(`
+      *,
+      patients (
+        id,
+        patient_id,
+        first_name,
+        last_name,
+        date_of_birth,
+        gender,
+        phone,
+        email
+      ),
+      rooms (
+        id,
+        room_number,
+        room_type,
+        rate_per_day
+      ),
+      staff (
+        id,
+        first_name,
+        last_name,
+        role,
+        employment_role,
+        department
+      )
+    `)
+    .eq('id', invoice.admission_id)
+    .single();
+
+  if (!admissionData) {
     throw createError('Admission data not found', 404);
   }
 
-  const { data: billItems, error: billItemsError } = await supabase
+  // Fetch bill items
+  const { data: billItems } = await supabase
     .from('bill_items')
     .select('*')
     .eq('invoice_id', id)
     .order('created_at', { ascending: true });
 
-  if (billItemsError) {
-    logger.error('Bill items fetch failed for invoice email', { invoiceId: id, error: billItemsError });
-    throw createError('Failed to load invoice items', 500);
-  }
-
+  // Combine the data
   const invoiceWithRelations = {
     ...invoice,
-    admissions: admissionData,
+    admissions: {
+      ...admissionData,
+      staff: admissionData.staff ? {
+        ...admissionData.staff,
+        name: `${admissionData.staff.first_name} ${admissionData.staff.last_name}`
+      } : null
+    }
   };
 
-  const patientEmail = email || admissionData?.patients?.email;
+  const patientEmail = email || admissionData.patients?.email;
   if (!patientEmail) {
     throw createError('Patient email not found', 400);
   }
 
-  const patientName = `${admissionData?.patients?.first_name || ''} ${admissionData?.patients?.last_name || ''}`.trim() || 'Patient';
+  const patientName = `${invoiceWithRelations.admissions?.patients?.first_name || ''} ${invoiceWithRelations.admissions?.patients?.last_name || ''}`.trim();
+  
+  // Create email content
   const emailSubject = subject || `Invoice ${invoice.invoice_number} - ${env.HOSPITAL_NAME}`;
-  const textMessage =
-    message ||
-    `Dear ${patientName},
-
-Please find your invoice ${invoice.invoice_number} attached for your records.
-
-Total Amount: ₹${Number(invoice.total_amount || 0).toLocaleString('en-IN')}
-Status: ${invoice.status}
-
-If you have already settled this invoice, please ignore this message.
-
-Regards,
-${env.HOSPITAL_NAME}
-${env.HOSPITAL_PHONE} | ${env.HOSPITAL_EMAIL}`;
+  const emailMessage = message || `Dear ${patientName},\n\nPlease find your invoice ${invoice.invoice_number} details below.\n\nTotal Amount: ₹${Number(invoice.total_amount).toLocaleString()}\nStatus: ${invoice.status}\n\nThank you for choosing ${env.HOSPITAL_NAME}.\n\nBest regards,\n${env.HOSPITAL_LEAD_PHYSICIAN}\n${env.HOSPITAL_NAME}\n${env.HOSPITAL_EMERGENCY_INFO}\n${env.HOSPITAL_EMAIL} | ${env.HOSPITAL_PHONE}`;
 
   try {
-    const { generateInvoicePDF } = await import('../utils/pdf-generator.js');
-    const pdfBuffer = await generateInvoicePDF({
-      invoice: invoiceWithRelations,
-      billItems: billItems || [],
-      patientName,
-      doctorName: admissionData?.staff?.name || 'Attending Doctor',
-    });
-
-    await sendEmail({
-      to: patientEmail,
-      subject: emailSubject,
-      html: buildInvoiceEmailHtml({
-        patientName,
-        message: textMessage,
-        invoiceNumber: invoice.invoice_number,
-        status: invoice.status,
-        totalAmount: Number(invoice.total_amount || 0),
-        outstandingAmount: Number(invoice.total_amount || 0) - Number(invoice.paid_amount || 0),
-        invoiceId: invoice.id,
-      }),
-      attachments: [
-        {
-          filename: `invoice-${invoice.invoice_number}.pdf`,
-          content: pdfBuffer,
-          contentType: 'application/pdf',
-        },
-      ],
-    });
-
-    logger.info('Invoice email sent', {
-      invoiceId: id,
-      invoiceNumber: invoice.invoice_number,
-      recipient: patientEmail,
-      sentBy: req.user?.staff_id,
-    });
-
-    res.json({
-      success: true,
-      data: {
-        invoice_id: id,
-        recipient: patientEmail,
-      },
-    });
-  } catch (error) {
-    logger.error('Failed to send invoice email', {
-      invoiceId: id,
-      error: error instanceof Error ? error.message : error,
-    });
-    throw createError('Failed to send invoice email', 500);
-  }
-}));
-
-const escapeHtml = (value = ''): string =>
-  value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-
-const formatCurrencyINR = (amount: number): string =>
-  new Intl.NumberFormat('en-IN', {
-    style: 'currency',
-    currency: 'INR',
-    minimumFractionDigits: 2,
-  }).format(amount || 0);
-
-const buildInvoiceEmailHtml = ({
-  patientName,
-  message,
-  invoiceNumber,
-  status,
-  totalAmount,
-  outstandingAmount,
-  invoiceId,
-}: {
-  patientName: string;
-  message: string;
-  invoiceNumber: string;
-  status: string;
-  totalAmount: number;
-  outstandingAmount: number;
-  invoiceId: string;
-}): string => {
-  const formattedMessage = message
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => `<p style="margin: 0 0 12px;">${escapeHtml(line)}</p>`)
-    .join('');
-
-  const invoiceUrl = `${env.PORTAL_URL}/admin/billing/${invoiceId}`;
-
-  return `
-    <div style="font-family: 'Segoe UI', Arial, sans-serif; color: #2c3e50; line-height: 1.6;">
-      <p style="margin: 0 0 12px;">Dear ${escapeHtml(patientName)},</p>
-      ${formattedMessage}
-      <div style="margin: 24px 0; padding: 16px; border: 1px solid #dfe6e9; border-radius: 10px; background: #f8fbfc;">
-        <h3 style="margin: 0 0 12px; color: #1a5f7a;">Invoice Summary</h3>
-        <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-          <tbody>
-            <tr>
-              <td style="padding: 6px 0; color: #7f8c8d;">Invoice #</td>
-              <td style="padding: 6px 0; font-weight: 600;">${escapeHtml(invoiceNumber)}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 0; color: #7f8c8d;">Status</td>
-              <td style="padding: 6px 0; font-weight: 600; text-transform: capitalize;">${escapeHtml(status)}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 0; color: #7f8c8d;">Total Amount</td>
-              <td style="padding: 6px 0; font-weight: 600;">${formatCurrencyINR(totalAmount)}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 0; color: #7f8c8d;">Outstanding</td>
-              <td style="padding: 6px 0; font-weight: 600;">${formatCurrencyINR(Math.max(outstandingAmount, 0))}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <p style="margin: 0 0 16px;">You can also view or download this invoice online:</p>
-      <p style="margin: 0 0 24px;">
-        <a href="${invoiceUrl}" style="display: inline-block; padding: 10px 18px; background: #1a5f7a; color: #ffffff; text-decoration: none; border-radius: 6px;">View Invoice</a>
-      </p>
-      <p style="margin: 0 0 12px;">Regards,<br/>${escapeHtml(env.HOSPITAL_NAME)}<br/>${escapeHtml(env.HOSPITAL_PHONE)} | ${escapeHtml(env.HOSPITAL_EMAIL)}</p>
-    </div>
-  `;
-};
-
-export default router;
+    // Generate PDF invoice
+    const pdfBuffer = await new Promise<Buffer>((resolve, reject) => {
+      const htmlContent = generateInvoiceHTML(invoiceWithRelations, billItems || []);
+      
+      puppeteer.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--single-process',
+          '--disable-gpu'
+        ]
+      }).then(async (browser) => {
+        try {
+          const page = await browser.newPage();
+          await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
+          
+          const pdfUint8Array = await page.pdf({
+            format: 'A4',
+            printBackground: true,
+            margin: {
+              top: '20px',
+              right: '20px',
+              bottom: '20px',
+              left: '20px'
+            }
+          });
+          
+        } catch (error) {
+          logger.error("PDF generation failed", { error, invoiceId: invoice.id });
+          reject(error);
+        }
