@@ -267,30 +267,6 @@ router.post('/', authenticateToken, asyncHandler(async (req: AuthenticatedReques
     throw createError('Failed to create admission', 500);
   }
 
-  if (room_id) {
-    const roomUpdates: Record<string, unknown> = {
-      is_available: false,
-      current_patient_id: patient_id,
-      status: 'occupied',
-      occupied_beds: (roomDetails?.occupied_beds ?? 0) + 1,
-    };
-
-    const { error: roomUpdateError } = await supabase
-      .from('rooms')
-      .update(roomUpdates)
-      .eq('id', room_id);
-
-    if (roomUpdateError) {
-      throw createError('Failed to update room availability', 500);
-    }
-
-    logger.info('Room assigned to patient', {
-      roomId: room_id,
-      patientId: patient_id,
-      admissionId: data.id
-    });
-  }
-
   if (bed_id) {
     const { error: bedUpdateError } = await supabase
       .from('beds')
@@ -318,10 +294,30 @@ router.post('/', authenticateToken, asyncHandler(async (req: AuthenticatedReques
 }));
 
 router.put('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const { status, discharge_date, reason, duration, room_id, include_in_audit, disease_details, treatment_given, after_effects } = req.body;
+  const {
+    status,
+    discharge_date,
+    reason,
+    duration,
+    room_id,
+    include_in_audit,
+    disease_details,
+    treatment_given,
+    after_effects,
+  } = req.body;
   const updates: Record<string, unknown> = {
     updated_at: new Date().toISOString(),
   };
+
+  const sanitizeNullableString = (value: unknown) => {
+    if (typeof value !== 'string') {
+      return value;
+    }
+    const trimmed = value.trim();
+    return trimmed === '' ? null : value;
+  };
+
+  const sanitizedRoomId = room_id !== undefined ? sanitizeNullableString(room_id) : undefined;
 
   if (status) {
     const normalizedStatus = status.toLowerCase();
@@ -346,7 +342,7 @@ router.put('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequ
   }
 
   if (room_id !== undefined) {
-    updates.room_id = room_id;
+    updates.room_id = sanitizedRoomId;
   }
 
   if (include_in_audit !== undefined) {
@@ -373,6 +369,11 @@ router.put('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequ
     .single();
 
   if (error || !data) {
+    logger.error('Admission update failed', {
+      admissionId: req.params.id,
+      error,
+      updates,
+    });
     throw createError('Failed to update admission', 500);
   }
 
@@ -400,7 +401,7 @@ router.put('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequ
   }
 
   // Handle room changes when room_id is updated
-  if (room_id !== undefined && room_id !== data.room_id) {
+  if (room_id !== undefined && sanitizedRoomId !== data.room_id) {
     // Release old room
     if (data.room_id) {
       await supabase

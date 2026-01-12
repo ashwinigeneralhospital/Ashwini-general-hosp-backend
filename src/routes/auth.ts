@@ -6,6 +6,14 @@ import { asyncHandler, createError } from '../middlewares/errorHandler.js';
 import { authenticateToken, AuthenticatedRequest } from '../middlewares/auth.js';
 import { logger } from '../utils/logger.js';
 import { env } from '../config/env.js';
+import {
+  generateEmailOtp,
+  hashOtp,
+  sendTwoFactorEmailOtp,
+  SUPPORTED_METHODS,
+  TwoFactorMethod,
+  verifyTotpCode,
+} from '../services/two-factor-service.js';
 
 const router = Router();
 const supabase = createClient(
@@ -13,9 +21,27 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
+const respondTwoFactorRequired = (
+  res: Response,
+  method: TwoFactorMethod,
+  message?: string,
+  expiresAt?: string,
+) => {
+  return res.status(202).json({
+    success: true,
+    data: {
+      requiresTwoFactor: true,
+      method,
+      message,
+      expiresAt,
+    },
+  });
+};
+
 // Login endpoint with direct database authentication
 router.post('/login', asyncHandler(async (req: any, res: Response) => {
   const { email, password } = req.body;
+  const otp = typeof req.body?.otp === 'string' ? req.body.otp.trim() : undefined;
 
   if (!email || !password) {
     throw createError('Email and password are required', 400);
@@ -24,7 +50,24 @@ router.post('/login', asyncHandler(async (req: any, res: Response) => {
   const normalizedEmail = email.toLowerCase().trim();
 
   // Find staff by email (normalized fallback to original column for backwards compatibility)
-  const staffColumns = 'id, first_name, last_name, email, role, is_active, employment_status, department, phone, password_hash, requires_password_reset';
+  const staffColumns = `
+    id,
+    first_name,
+    last_name,
+    email,
+    role,
+    is_active,
+    employment_status,
+    department,
+    phone,
+    password_hash,
+    requires_password_reset,
+    two_factor_enabled,
+    two_factor_method,
+    two_factor_secret,
+    two_factor_login_otp,
+    two_factor_login_otp_expires_at
+  `;
 
   let staffData = null;
   let staffError = null;
@@ -79,6 +122,86 @@ router.post('/login', asyncHandler(async (req: any, res: Response) => {
     .map((part) => (typeof part === 'string' ? part.trim() : ''))
     .filter(Boolean)
     .join(' ') || staffData.email;
+
+  if (staffData.two_factor_enabled) {
+    let method: TwoFactorMethod = (staffData.two_factor_method as TwoFactorMethod) || 'totp';
+    if (!SUPPORTED_METHODS.includes(method)) {
+      logger.warn('Unsupported 2FA method on staff record, defaulting to TOTP', {
+        staffId: staffData.id,
+        method: staffData.two_factor_method,
+      });
+      method = 'totp';
+    }
+
+    if (method === 'email') {
+      if (!otp) {
+        const { code, hashed, expiresAt } = generateEmailOtp();
+
+        await supabase
+          .from('staff')
+          .update({
+            two_factor_login_otp: hashed,
+            two_factor_login_otp_expires_at: expiresAt,
+          })
+          .eq('id', staffData.id);
+
+        await sendTwoFactorEmailOtp(staffData.email, code, 'login');
+
+        return respondTwoFactorRequired(
+          res,
+          method,
+          'Verification code sent to your registered email address',
+          expiresAt,
+        );
+      }
+
+      if (!staffData.two_factor_login_otp || !staffData.two_factor_login_otp_expires_at) {
+        throw createError('Request a new verification code to continue login', 400);
+      }
+
+      const expiresAt = new Date(staffData.two_factor_login_otp_expires_at).getTime();
+      if (Date.now() > expiresAt) {
+        await supabase
+          .from('staff')
+          .update({
+            two_factor_login_otp: null,
+            two_factor_login_otp_expires_at: null,
+          })
+          .eq('id', staffData.id);
+        throw createError('Verification code expired. Request a new code.', 400);
+      }
+
+      if (hashOtp(otp) !== staffData.two_factor_login_otp) {
+        throw createError('Invalid verification code', 400);
+      }
+
+      await supabase
+        .from('staff')
+        .update({
+          two_factor_login_otp: null,
+          two_factor_login_otp_expires_at: null,
+        })
+        .eq('id', staffData.id);
+    } else {
+      if (!otp) {
+        return respondTwoFactorRequired(
+          res,
+          method,
+          'Enter the 6-digit code from your authenticator app to continue',
+        );
+      }
+
+      if (!staffData.two_factor_secret) {
+        logger.error('Two-factor secret missing for staff', { staffId: staffData.id });
+        throw createError('Two-factor authentication is not configured correctly. Contact administrator.', 500);
+      }
+
+      const verified = verifyTotpCode(staffData.two_factor_secret, otp);
+      if (!verified) {
+        throw createError('Invalid verification code', 400);
+      }
+    }
+  }
 
   // Generate JWT token
   const tokenPayload = {

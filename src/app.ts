@@ -26,6 +26,8 @@ import dashboardRoutes from './routes/dashboard.js';
 import emailTemplateRoutes from './routes/email-templates.js';
 import billingPdfRoutes from './routes/billing-pdf.js';
 import roomHistoryRoutes from './routes/room-history.js';
+import twoFactorRoutes from './routes/two-factor.js';
+import admissionSummariesRoutes from './routes/admission-summaries.js';
 
 dotenv.config();
 
@@ -68,6 +70,7 @@ app.use('/api/staff', staffRoutes);
 app.use('/api/patients', patientRoutes);
 app.use('/api/rooms', roomRoutes);
 app.use('/api/admissions', admissionRoutes);
+app.use('/api/billing', billingPdfRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api/insurance', insuranceRoutes);
 app.use('/api/roster', rosterRoutes);
@@ -83,6 +86,8 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/email-templates', emailTemplateRoutes);
 app.use('/api/billing-pdf', billingPdfRoutes);
 app.use('/api/room-history', roomHistoryRoutes);
+app.use('/api/two-factor', twoFactorRoutes);
+app.use('/api/admission-summaries', admissionSummariesRoutes);
 
 // 404 handler (must not use legacy wildcard syntax in Express 5)
 app.use((req, res) => {

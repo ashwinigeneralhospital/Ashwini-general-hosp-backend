@@ -6,6 +6,8 @@ import { logger } from '../utils/logger.js';
 import { sendEmail } from '../utils/mailer.js';
 import { getHospitalLogoDataUri } from '../utils/logo.js';
 import { env } from '../config/env.js';
+import { mergeInvoiceWithLabReports } from '../utils/pdf-merger.js';
+import { getSignedDownloadUrl } from '../utils/r2.js';
 
 const router = Router();
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -122,11 +124,215 @@ const fetchAdmissionWithRelations = async (admissionId: string) => {
 
   return {
     ...admission,
-    patients: patientResult.data ?? null,
-    rooms: roomResult.data ?? null,
-    beds: bedResult.data ?? null,
+    patients: patientResult.data,
+    rooms: roomResult.data,
+    beds: bedResult.data,
     staff: staffData,
   };
+};
+
+const ensureMedicationBillItems = async (
+  invoiceId: string,
+  admissionId: string,
+  currentItems: any[],
+) => {
+  const medicationRefs = new Set(
+    currentItems
+      .filter(
+        (item) =>
+          item?.item_type === 'medication' ||
+          item?.item_name?.toLowerCase?.().includes('med'),
+      )
+      .map((item) => item.reference_id)
+      .filter(Boolean),
+  );
+
+  const { data: medications, error: medicationsError } = await supabase
+    .from('patient_medications')
+    .select('*')
+    .eq('admission_id', admissionId);
+
+  if (medicationsError) {
+    logger.warn('Failed to load medications for invoice sync', {
+      invoiceId,
+      admissionId,
+      error: medicationsError.message,
+    });
+    return currentItems;
+  }
+
+  const newMedicationItems = (medications ?? [])
+    .filter((med) => !medicationRefs.has(med.id))
+    .map((med) => {
+      const pricePerUnit = Number(med.price_per_unit ?? 0);
+      const unitsPerDose = Number(med.units_per_dose ?? 1);
+      const dosesGiven = Number(med.doses_administered ?? 0);
+      const medTotal = pricePerUnit * unitsPerDose * dosesGiven;
+
+      if (medTotal <= 0) {
+        return null;
+      }
+
+      return {
+        invoice_id: invoiceId,
+        item_type: 'medication',
+        item_name: med.name || 'Medication Charge',
+        item_description: `Medication administered - ${dosesGiven} dose${dosesGiven === 1 ? '' : 's'}`,
+        quantity: dosesGiven,
+        unit_price: pricePerUnit * unitsPerDose,
+        total_price: medTotal,
+        reference_id: med.id,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+    })
+    .filter(Boolean) as any[];
+
+  if (!newMedicationItems.length) {
+    return currentItems;
+  }
+
+  const { data: insertedItems, error: insertError } = await supabase
+    .from('bill_items')
+    .insert(newMedicationItems)
+    .select('*');
+
+  if (insertError) {
+    logger.error('Failed to persist medication bill items', {
+      invoiceId,
+      admissionId,
+      error: insertError.message,
+    });
+    // Fall back to returning optimistic items (without DB IDs)
+    return [...currentItems, ...newMedicationItems];
+  }
+
+  logger.info('Medication bill items synced', {
+    invoiceId,
+    admissionId,
+    insertedCount: insertedItems?.length ?? 0,
+  });
+
+  // Recalculate invoice total after adding medication items
+  const allItems = [...currentItems, ...(insertedItems ?? [])];
+  const newTotal = allItems.reduce((sum, item) => sum + Number(item.total_price || 0), 0);
+
+  const { error: updateError } = await supabase
+    .from('invoices')
+    .update({ total_amount: newTotal, updated_at: new Date().toISOString() })
+    .eq('id', invoiceId);
+
+  if (updateError) {
+    logger.error('Failed to update invoice total after medication sync', {
+      invoiceId,
+      error: updateError.message,
+    });
+  } else {
+    logger.info('Invoice total updated after medication sync', {
+      invoiceId,
+      newTotal,
+    });
+  }
+
+  return allItems;
+};
+
+const ensureLabReportBillItems = async (
+  invoiceId: string,
+  admissionId: string,
+  currentItems: any[],
+) => {
+  const labReportRefs = new Set(
+    currentItems
+      .filter((item) => item?.item_type === 'lab')
+      .map((item) => item.reference_id)
+      .filter(Boolean),
+  );
+
+  const { data: labReports, error: labReportsError } = await supabase
+    .from('lab_reports')
+    .select('*')
+    .eq('admission_id', admissionId)
+    .eq('billing_status', 'billed');
+
+  if (labReportsError) {
+    logger.warn('Failed to load lab reports for invoice sync', {
+      invoiceId,
+      admissionId,
+      error: labReportsError.message,
+    });
+    return currentItems;
+  }
+
+  const newLabReportItems = (labReports ?? [])
+    .filter((report) => !labReportRefs.has(report.id))
+    .map((report) => {
+      const price = Number(report.price ?? 0);
+
+      if (price <= 0) {
+        return null;
+      }
+
+      return {
+        invoice_id: invoiceId,
+        item_type: 'lab',
+        item_name: report.report_title || report.type || 'Lab Report',
+        item_description: report.report_description || `Lab test: ${report.type}`,
+        quantity: 1,
+        unit_price: price,
+        total_price: price,
+        reference_id: report.id,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+    })
+    .filter(Boolean) as any[];
+
+  if (!newLabReportItems.length) {
+    return currentItems;
+  }
+
+  const { data: insertedItems, error: insertError } = await supabase
+    .from('bill_items')
+    .insert(newLabReportItems)
+    .select('*');
+
+  if (insertError) {
+    logger.error('Failed to persist lab report bill items', {
+      invoiceId,
+      admissionId,
+      error: insertError.message,
+    });
+    return [...currentItems, ...newLabReportItems];
+  }
+
+  logger.info('Lab report bill items synced', {
+    invoiceId,
+    admissionId,
+    insertedCount: insertedItems?.length ?? 0,
+  });
+
+  const allItems = [...currentItems, ...(insertedItems ?? [])];
+  const newTotal = allItems.reduce((sum, item) => sum + Number(item.total_price || 0), 0);
+
+  const { error: updateError } = await supabase
+    .from('invoices')
+    .update({ total_amount: newTotal, updated_at: new Date().toISOString() })
+    .eq('id', invoiceId);
+
+  if (updateError) {
+    logger.error('Failed to update invoice total after lab report sync', {
+      invoiceId,
+      error: updateError.message,
+    });
+  } else {
+    logger.info('Invoice total updated after lab report sync', {
+      invoiceId,
+      newTotal,
+    });
+  }
+
+  return allItems;
 };
 
 // Get all invoices
@@ -395,7 +601,19 @@ router.get('/patient/:patientId/charges', authenticateToken, asyncHandler(async 
 
   let query = supabase
     .from('patient_medications')
-    .select('id, patient_id, admission_id, name, price_per_unit, units_per_dose, total_doses, doses_administered, last_administered_at, status')
+    .select(`
+      id,
+      patient_id,
+      admission_id,
+      name,
+      price_per_unit,
+      units_per_dose,
+      total_doses,
+      doses_administered,
+      last_administered_at,
+      status,
+      medication_catalog_id
+    `)
     .eq('patient_id', patientId);
 
   if (admissionId) {
@@ -415,9 +633,61 @@ router.get('/patient/:patientId/charges', authenticateToken, asyncHandler(async 
     throw createError('Failed to fetch medication charges', 500);
   }
 
-  const medications = (data ?? []).map((med) => {
-    const pricePerUnit = Number(med.price_per_unit ?? 0);
-    const unitsPerDose = Number(med.units_per_dose ?? 1);
+  const medicationsRaw = data ?? [];
+
+  let catalogLookup: Record<string, { price_per_unit?: number | null; default_units_per_dose?: number | null }> = {};
+  const catalogIds = Array.from(
+    new Set(
+      medicationsRaw
+        .map((med) => med.medication_catalog_id)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0)
+    )
+  );
+
+  if (catalogIds.length > 0) {
+    const { data: catalogData, error: catalogError } = await supabase
+      .from('medication_catalog')
+      .select('id, price_per_unit, default_units_per_dose')
+      .in('id', catalogIds);
+
+    if (catalogError) {
+      logger.error('Failed to load medication catalog fallback data', {
+        catalogIds,
+        error: catalogError.message,
+        details: catalogError.details,
+        hint: catalogError.hint,
+      });
+      throw createError('Failed to fetch medication charges', 500);
+    }
+
+    catalogLookup = Object.fromEntries(
+      (catalogData ?? []).map((catalog) => [
+        catalog.id,
+        {
+          price_per_unit: catalog.price_per_unit,
+          default_units_per_dose: catalog.default_units_per_dose,
+        },
+      ])
+    );
+  }
+
+  const toNumber = (value: unknown, fallback: number): number => {
+    if (value === null || value === undefined || value === '') return fallback;
+    const parsed = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+
+  const medications = medicationsRaw.map((med) => {
+    const catalog = med.medication_catalog_id ? catalogLookup[med.medication_catalog_id] : undefined;
+    const catalogPrice = toNumber(catalog?.price_per_unit, 0);
+    const catalogUnits = toNumber(catalog?.default_units_per_dose, 1);
+
+    const directPrice = toNumber(med.price_per_unit, -1);
+    const pricePerUnit = directPrice > 0 ? directPrice : catalogPrice;
+
+    const directUnits = toNumber(med.units_per_dose, -1);
+    const unitsPerDose = directUnits > 0 ? directUnits : catalogUnits || 1;
+
     const dosesGiven = Number(med.doses_administered ?? 0);
     const plannedDoses = med.total_doses ?? null;
     const totalCost = pricePerUnit * unitsPerDose * dosesGiven;
@@ -427,8 +697,8 @@ router.get('/patient/:patientId/charges', authenticateToken, asyncHandler(async 
       name: med.name,
       status: med.status,
       admissionId: med.admission_id,
-      pricePerUnit,
-      unitsPerDose,
+      pricePerUnit: pricePerUnit > 0 ? pricePerUnit : 0,
+      unitsPerDose: unitsPerDose > 0 ? unitsPerDose : 1,
       dosesAdministered: dosesGiven,
       totalDoses: plannedDoses,
       remainingDoses: plannedDoses !== null ? Math.max(plannedDoses - dosesGiven, 0) : null,
@@ -585,6 +855,116 @@ router.delete('/:id', authenticateToken, requireBilling, asyncHandler(async (req
 
 // Get invoice with bill items
 router.get('/:id/details', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+
+  const { data: invoice, error: invoiceError } = await supabase
+    .from('invoices')
+    .select('*')
+    .eq('id', id)
+    .single();
+
+  if (invoiceError || !invoice) {
+    throw createError('Invoice not found', 404);
+  }
+
+  logger.info('Fetching admission data for invoice', {
+    invoiceId: id,
+    admissionId: invoice.admission_id
+  });
+
+  // Fetch related admission and patient data manually
+  try {
+    const admissionData = await fetchAdmissionWithRelations(invoice.admission_id);
+    logger.info('Admission data fetched', {
+      invoiceId: id,
+      admissionFound: !!admissionData,
+      patientFound: !!admissionData?.patients,
+      doctorId: admissionData?.doctor_id,
+      admissionData: admissionData ? {
+        id: admissionData.id,
+        doctor_id: admissionData.doctor_id,
+        hasDoctorId: !!admissionData.doctor_id
+      } : null
+    });
+
+    const { data: billItems, error: itemsError } = await supabase
+      .from('bill_items')
+      .select(BILL_ITEM_SELECT)
+      .eq('invoice_id', id)
+      .order('created_at', { ascending: true });
+
+    if (itemsError) {
+      throw createError('Failed to fetch bill items', 500);
+    }
+
+    let finalBillItems = await ensureMedicationBillItems(
+      invoice.id,
+      invoice.admission_id,
+      billItems ? [...billItems] : []
+    );
+
+    // Also ensure lab report bill items are included
+    finalBillItems = await ensureLabReportBillItems(
+      invoice.id,
+      invoice.admission_id,
+      finalBillItems
+    );
+
+    let medicationDetails: any[] = [];
+    const medicationReferenceIds = finalBillItems
+      .filter((item) => item.item_type === 'medication' && item.reference_id)
+      .map((item) => item.reference_id as string);
+
+    if (medicationReferenceIds.length) {
+      const { data: medicationRecords, error: medicationFetchError } = await supabase
+        .from('patient_medications')
+        .select(
+          `
+            id,
+            name,
+            route,
+            frequency,
+            dose_unit,
+            units_per_dose,
+            doses_administered,
+            price_per_unit,
+            administered_at,
+            notes
+          `,
+        )
+        .in('id', medicationReferenceIds);
+
+      if (medicationFetchError) {
+        logger.warn('Failed to fetch medication details for invoice', {
+          invoiceId: id,
+          admissionId: invoice.admission_id,
+          error: medicationFetchError.message,
+        });
+      } else {
+        medicationDetails = medicationRecords ?? [];
+      }
+    }
+
+    const invoiceWithRelations = {
+      ...invoice,
+      admissions: admissionData,
+      billItems: finalBillItems,
+      medicationDetails,
+    };
+
+    res.json({
+      success: true,
+      data: invoiceWithRelations,
+    });
+  } catch (fetchError: any) {
+    logger.error('Failed to fetch admission data for invoice details', {
+      invoiceId: id,
+      admissionId: invoice.admission_id,
+      error: fetchError?.message,
+    });
+    throw createError('Failed to fetch admission data', 500);
+  }
+}));
 
 // Generate PDF invoice using PDFKit
 router.get("/:id/pdf", authenticateToken, requireBilling, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
@@ -765,67 +1145,6 @@ router.get("/:id/pdf", authenticateToken, requireBilling, asyncHandler(async (re
     throw createError("Failed to generate PDF", 500);
   }
 }));
-  const { id } = req.params;
-
-  const { data: invoice, error: invoiceError } = await supabase
-    .from('invoices')
-    .select('*')
-    .eq('id', id)
-    .single();
-
-  if (invoiceError || !invoice) {
-    throw createError('Invoice not found', 404);
-  }
-
-  logger.info('Fetching admission data for invoice', {
-    invoiceId: id,
-    admissionId: invoice.admission_id
-  });
-
-  // Fetch related admission and patient data manually
-  try {
-    const admissionData = await fetchAdmissionWithRelations(invoice.admission_id);
-    logger.info('Admission data fetched', {
-      invoiceId: id,
-      admissionFound: !!admissionData,
-      patientFound: !!admissionData?.patients,
-      doctorId: admissionData?.doctor_id,
-      admissionData: admissionData ? {
-        id: admissionData.id,
-        doctor_id: admissionData.doctor_id,
-        hasDoctorId: !!admissionData.doctor_id
-      } : null
-    });
-
-    const { data: billItems, error: itemsError } = await supabase
-      .from('bill_items')
-      .select(BILL_ITEM_SELECT)
-      .eq('invoice_id', id)
-      .order('created_at', { ascending: true });
-
-    if (itemsError) {
-      throw createError('Failed to fetch bill items', 500);
-    }
-
-    const invoiceWithRelations = {
-      ...invoice,
-      admissions: admissionData,
-      billItems: billItems || [],
-    };
-
-    res.json({
-      success: true,
-      data: invoiceWithRelations,
-    });
-  } catch (fetchError: any) {
-    logger.error('Failed to fetch admission data for invoice details', {
-      invoiceId: id,
-      admissionId: invoice.admission_id,
-      error: fetchError?.message,
-    });
-    throw createError('Failed to fetch admission data', 500);
-  }
-}));
 
 // Get room usage charges for admission
 router.get('/admission/:admissionId/room-charges', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
@@ -885,8 +1204,11 @@ router.post('/comprehensive', authenticateToken, requireBilling, asyncHandler(as
     bill_items = [],
     include_room_charges = true,
     include_medication_charges = true,
+    include_lab_reports = false,
     custom_items = [],
-    notes
+    notes,
+    medication_item_ids = [],
+    lab_report_ids = []
   } = req.body;
 
   if (!admission_id) {
@@ -966,17 +1288,70 @@ router.post('/comprehensive', authenticateToken, requireBilling, asyncHandler(as
 
   // Add medication charges if requested
   if (include_medication_charges) {
-    const { data: medications, error: medError } = await supabase
+    let medicationQuery = supabase
       .from('patient_medications')
       .select('*')
       .eq('admission_id', admission_id);
 
+    if (Array.isArray(medication_item_ids) && medication_item_ids.length > 0) {
+      medicationQuery = medicationQuery.in('id', medication_item_ids);
+    }
+
+    const { data: medications, error: medError } = await medicationQuery;
+
+    logger.info('Fetching medications for invoice', {
+      admission_id,
+      medication_item_ids,
+      medicationsFound: medications?.length ?? 0,
+      error: medError?.message
+    });
+
     if (!medError && medications) {
+      // Fetch catalog prices for medications that don't have direct prices
+      const catalogIds = medications
+        .filter(med => med.medication_catalog_id)
+        .map(med => med.medication_catalog_id);
+      
+      let catalogLookup: Record<string, { price_per_unit?: number; default_units_per_dose?: number }> = {};
+      
+      if (catalogIds.length > 0) {
+        const { data: catalogData } = await supabase
+          .from('medication_catalog')
+          .select('id, price_per_unit, default_units_per_dose')
+          .in('id', catalogIds);
+        
+        if (catalogData) {
+          catalogLookup = Object.fromEntries(
+            catalogData.map(cat => [cat.id, {
+              price_per_unit: cat.price_per_unit,
+              default_units_per_dose: cat.default_units_per_dose
+            }])
+          );
+        }
+      }
+
       medications.forEach(med => {
-        const pricePerUnit = Number(med.price_per_unit ?? 0);
-        const unitsPerDose = Number(med.units_per_dose ?? 1);
+        // Use catalog fallback if direct price is not set
+        const catalog = med.medication_catalog_id ? catalogLookup[med.medication_catalog_id] : undefined;
+        const directPrice = Number(med.price_per_unit ?? 0);
+        const pricePerUnit = directPrice > 0 ? directPrice : Number(catalog?.price_per_unit ?? 0);
+        
+        const directUnits = Number(med.units_per_dose ?? 0);
+        const unitsPerDose = directUnits > 0 ? directUnits : Number(catalog?.default_units_per_dose ?? 1);
+        
         const dosesGiven = Number(med.doses_administered ?? 0);
         const medTotal = pricePerUnit * unitsPerDose * dosesGiven;
+        
+        logger.info('Processing medication for invoice', {
+          medicationId: med.id,
+          name: med.name,
+          directPrice,
+          catalogPrice: catalog?.price_per_unit,
+          pricePerUnit,
+          unitsPerDose,
+          dosesGiven,
+          medTotal
+        });
         
         if (medTotal > 0) {
           totalAmount += medTotal;
@@ -989,7 +1364,80 @@ router.post('/comprehensive', authenticateToken, requireBilling, asyncHandler(as
             total_price: medTotal,
             reference_id: med.id
           });
+        } else {
+          logger.warn('Medication skipped due to zero total', {
+            medicationId: med.id,
+            name: med.name,
+            pricePerUnit,
+            unitsPerDose,
+            dosesGiven,
+            hasCatalogId: !!med.medication_catalog_id,
+            catalogPrice: catalog?.price_per_unit
+          });
         }
+      });
+    } else if (medError) {
+      logger.error('Failed to fetch medications for invoice', {
+        admission_id,
+        error: medError.message
+      });
+    }
+  }
+
+  // Add lab report charges if requested
+  if (include_lab_reports) {
+    let labQuery = supabase
+      .from('lab_reports')
+      .select('id, report_title, test_type, price, billing_status')
+      .eq('admission_id', admission_id)
+      .eq('billing_status', 'pending');
+
+    if (Array.isArray(lab_report_ids) && lab_report_ids.length > 0) {
+      labQuery = labQuery.in('id', lab_report_ids);
+    }
+
+    const { data: labReports, error: labError } = await labQuery;
+
+    logger.info('Fetching lab reports for invoice', {
+      admission_id,
+      lab_report_ids,
+      labReportsFound: labReports?.length ?? 0,
+      error: labError?.message
+    });
+
+    if (!labError && labReports) {
+      labReports.forEach(report => {
+        const reportPrice = Number(report.price ?? 0);
+        
+        logger.info('Processing lab report for invoice', {
+          reportId: report.id,
+          title: report.report_title,
+          price: reportPrice
+        });
+        
+        if (reportPrice > 0) {
+          totalAmount += reportPrice;
+          invoiceItems.push({
+            item_type: 'lab',
+            item_name: report.report_title || report.test_type || 'Lab Report',
+            item_description: `Lab Test: ${report.test_type}`,
+            quantity: 1,
+            unit_price: reportPrice,
+            total_price: reportPrice,
+            reference_id: report.id
+          });
+        } else {
+          logger.warn('Lab report skipped due to zero price', {
+            reportId: report.id,
+            title: report.report_title,
+            price: reportPrice
+          });
+        }
+      });
+    } else if (labError) {
+      logger.error('Failed to fetch lab reports for invoice', {
+        admission_id,
+        error: labError.message
       });
     }
   }
@@ -1029,6 +1477,15 @@ router.post('/comprehensive', authenticateToken, requireBilling, asyncHandler(as
 
   const invoice_number = `INV-${nextId.toString().padStart(6, '0')}`;
 
+  // Separate items by type for JSONB storage
+  const medicationItems = invoiceItems.filter(item => item.item_type === 'medication');
+  const labItems = invoiceItems.filter(item => item.item_type === 'lab');
+  const customItems = invoiceItems.filter(item => 
+    item.item_type !== 'medication' && 
+    item.item_type !== 'lab' && 
+    item.item_type !== 'room'
+  );
+
   // Create invoice
   const { data: newInvoice, error: invoiceError } = await supabase
     .from('invoices')
@@ -1037,7 +1494,10 @@ router.post('/comprehensive', authenticateToken, requireBilling, asyncHandler(as
       invoice_number,
       total_amount: totalAmount,
       status: 'pending',
-      generated_by: req.user!.staff_id
+      generated_by: req.user!.staff_id,
+      medication_items: medicationItems,
+      lab_items: labItems,
+      custom_items: customItems
     })
     .select('*')
     .single();
@@ -1101,11 +1561,27 @@ router.post('/comprehensive', authenticateToken, requireBilling, asyncHandler(as
     throw createError('Failed to create bill items', 500);
   }
 
+  // Mark lab reports as billed
+  const labReportIdsInInvoice = invoiceItems
+    .filter(item => item.item_type === 'lab' && item.reference_id)
+    .map(item => item.reference_id);
+
+  if (labReportIdsInInvoice.length > 0) {
+    await supabase
+      .from('lab_reports')
+      .update({ billing_status: 'billed' })
+      .in('id', labReportIdsInInvoice);
+  }
+
   logger.info('Comprehensive invoice created', {
     invoiceId: newInvoice.id,
     invoiceNumber: invoice_number,
     totalAmount,
     itemsCount: billItemsToInsert.length,
+    medicationItemsCount: medicationItems.length,
+    labItemsCount: labItems.length,
+    roomItemsCount: invoiceItems.filter(i => i.item_type === 'room').length,
+    customItemsCount: customItems.length,
     createdBy: req.user!.staff_id
   });
 
@@ -1669,7 +2145,16 @@ const generateInvoiceHTML = (invoice: any, billItems: any[]) => {
 // Send invoice via email with PDF attachment
 router.post('/:id/send-email', authenticateToken, requireBilling, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
-  const { email, subject, message } = req.body;
+  const {
+    email,
+    subject,
+    message,
+    includeLabReports: includeLabReportsRaw,
+    includeSummary: includeSummaryRaw,
+  } = req.body;
+
+  const includeLabReports = includeLabReportsRaw === true || includeLabReportsRaw === 'true';
+  const includeSummary = includeSummaryRaw === true || includeSummaryRaw === 'true';
 
   const { data: invoice, error: invoiceError } = await supabase
     .from('invoices')
@@ -1711,7 +2196,10 @@ router.post('/:id/send-email', authenticateToken, requireBilling, asyncHandler(a
   }
 
   const patientName = `${admissionData?.patients?.first_name || ''} ${admissionData?.patients?.last_name || ''}`.trim() || 'Patient';
+  const doctorName = admissionData?.staff?.name || 'Attending Doctor';
   const emailSubject = subject || `Invoice ${invoice.invoice_number} - ${env.HOSPITAL_NAME}`;
+  const outstandingBase = Math.max(Number(invoice.total_amount || 0) - Number(invoice.paid_amount || 0), 0);
+  const outstandingAmount = invoice.status === 'paid' ? 0 : outstandingBase;
   const textMessage =
     message ||
     `Dear ${patientName},
@@ -1720,6 +2208,7 @@ Please find your invoice ${invoice.invoice_number} attached for your records.
 
 Total Amount: ₹${Number(invoice.total_amount || 0).toLocaleString('en-IN')}
 Status: ${invoice.status}
+Outstanding: ₹${outstandingAmount.toLocaleString('en-IN')}
 
 If you have already settled this invoice, please ignore this message.
 
@@ -1729,12 +2218,53 @@ ${env.HOSPITAL_PHONE} | ${env.HOSPITAL_EMAIL}`;
 
   try {
     const { generateInvoicePDF } = await import('../utils/pdf-generator.js');
-    const pdfBuffer = await generateInvoicePDF({
+    let admissionSummary = null;
+    if (includeSummary && invoice.admission_id) {
+      const { data: summary } = await supabase
+        .from('admission_summaries')
+        .select('chief_complaint, diagnosis, treatment_provided, outcome, recommendations')
+        .eq('admission_id', invoice.admission_id)
+        .maybeSingle();
+      admissionSummary = summary;
+    }
+
+    let pdfBuffer = await generateInvoicePDF({
       invoice: invoiceWithRelations,
       billItems: billItems || [],
       patientName,
-      doctorName: admissionData?.staff?.name || 'Attending Doctor',
+      doctorName,
+      admissionSummary,
     });
+
+    if (includeLabReports) {
+      const labBillItems = (billItems || []).filter((item) => item.item_type === 'lab' && item.reference_id);
+      if (labBillItems.length > 0) {
+        const labReportIds = labBillItems.map((item) => item.reference_id).filter(Boolean);
+        const { data: labReports } = await supabase
+          .from('lab_reports')
+          .select('id, pdf_url, pdf_storage_path')
+          .in('id', labReportIds);
+
+        if (labReports && labReports.length > 0) {
+          const labPdfUrls: string[] = [];
+          for (const report of labReports) {
+            if (report.pdf_url) {
+              labPdfUrls.push(report.pdf_url);
+            } else if (report.pdf_storage_path) {
+              if (env.R2_PUBLIC_URL) {
+                labPdfUrls.push(`${env.R2_PUBLIC_URL}/${report.pdf_storage_path}`);
+              } else {
+                const signedUrl = await getSignedDownloadUrl(report.pdf_storage_path, 3600);
+                labPdfUrls.push(signedUrl);
+              }
+            }
+          }
+          if (labPdfUrls.length) {
+            pdfBuffer = await mergeInvoiceWithLabReports(pdfBuffer, labPdfUrls);
+          }
+        }
+      }
+    }
 
     await sendEmail({
       to: patientEmail,
@@ -1745,7 +2275,7 @@ ${env.HOSPITAL_PHONE} | ${env.HOSPITAL_EMAIL}`;
         invoiceNumber: invoice.invoice_number,
         status: invoice.status,
         totalAmount: Number(invoice.total_amount || 0),
-        outstandingAmount: Number(invoice.total_amount || 0) - Number(invoice.paid_amount || 0),
+        outstandingAmount,
         invoiceId: invoice.id,
       }),
       attachments: [

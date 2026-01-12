@@ -173,4 +173,295 @@ router.get('/alerts', authenticateToken, asyncHandler(async (req: AuthenticatedR
   }
 }));
 
+// Get doctor's assigned patients
+router.get('/doctor/patients', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (!req.user || !['doctor', 'admin'].includes(req.user.role)) {
+      throw createError('Access denied', 403);
+    }
+
+    const doctorId = req.user.staff_id;
+
+    // Get active admissions assigned to this doctor
+    const { data: admissions, error } = await supabase
+      .from('admissions')
+      .select(`
+        id,
+        admission_date,
+        discharge_date,
+        status,
+        diagnosis,
+        patients:patient_id (
+          id,
+          first_name,
+          last_name,
+          date_of_birth
+        ),
+        beds:bed_id (
+          bed_number,
+          rooms:room_id (
+            room_number,
+            room_type
+          )
+        )
+      `)
+      .eq('doctor_id', doctorId)
+      .in('status', ['admitted', 'under_treatment'])
+      .order('admission_date', { ascending: false });
+
+    if (error) {
+      logger.error('Failed to fetch doctor patients', { error, doctorId });
+      throw createError('Failed to fetch assigned patients', 500);
+    }
+
+    const patients = (admissions || []).map((admission: any) => ({
+      admissionId: admission.id,
+      patientId: admission.patients?.id,
+      patientName: `${admission.patients?.first_name || ''} ${admission.patients?.last_name || ''}`.trim(),
+      bedNumber: admission.beds?.bed_number || 'N/A',
+      roomNumber: admission.beds?.rooms?.room_number || 'N/A',
+      roomType: admission.beds?.rooms?.room_type || 'N/A',
+      diagnosis: admission.diagnosis || 'Not specified',
+      status: admission.status,
+      admissionDate: admission.admission_date,
+      dischargeDate: admission.discharge_date
+    }));
+
+    res.json({
+      success: true,
+      data: { patients }
+    });
+  } catch (error) {
+    logger.error('Failed to fetch doctor patients', { error, userId: req.user?.id });
+    throw createError('Failed to fetch assigned patients', 500);
+  }
+}));
+
+// Get doctor's dashboard stats
+router.get('/doctor/stats', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (!req.user || !['doctor', 'admin'].includes(req.user.role)) {
+      throw createError('Access denied', 403);
+    }
+
+    const doctorId = req.user.staff_id;
+
+    // Count active patients
+    const { count: activePatients } = await supabase
+      .from('admissions')
+      .select('*', { count: 'exact', head: true })
+      .eq('doctor_id', doctorId)
+      .in('status', ['admitted', 'under_treatment']);
+
+    // Count patients today (admitted today)
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const { count: patientsToday } = await supabase
+      .from('admissions')
+      .select('*', { count: 'exact', head: true })
+      .eq('doctor_id', doctorId)
+      .gte('admission_date', today.toISOString());
+
+    // Count pending notes (admissions without recent doctor notes)
+    const { count: pendingNotes } = await supabase
+      .from('admissions')
+      .select('*', { count: 'exact', head: true })
+      .eq('doctor_id', doctorId)
+      .in('status', ['admitted', 'under_treatment']);
+
+    // Count total patients this month
+    const firstDayOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+    const { count: patientsThisMonth } = await supabase
+      .from('admissions')
+      .select('*', { count: 'exact', head: true })
+      .eq('doctor_id', doctorId)
+      .gte('admission_date', firstDayOfMonth.toISOString());
+
+    res.json({
+      success: true,
+      data: {
+        activePatients: activePatients || 0,
+        patientsToday: patientsToday || 0,
+        pendingNotes: pendingNotes || 0,
+        patientsThisMonth: patientsThisMonth || 0
+      }
+    });
+  } catch (error) {
+    logger.error('Failed to fetch doctor stats', { error, userId: req.user?.id });
+    throw createError('Failed to fetch doctor statistics', 500);
+  }
+}));
+
+// Get nurse's assigned patients and medication tasks
+router.get('/nurse/patients', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (!req.user || !['nurse', 'admin'].includes(req.user.role)) {
+      throw createError('Access denied', 403);
+    }
+
+    // Get all active admissions with their medications
+    const { data: admissions, error } = await supabase
+      .from('admissions')
+      .select(`
+        id,
+        admission_date,
+        status,
+        diagnosis,
+        patients:patient_id (
+          id,
+          first_name,
+          last_name
+        ),
+        beds:bed_id (
+          id,
+          bed_number,
+          rooms:room_id (
+            room_number,
+            room_type
+          )
+        )
+      `)
+      .in('status', ['admitted', 'under_treatment'])
+      .order('admission_date', { ascending: false });
+
+    if (error) {
+      logger.error('Failed to fetch nurse patients', { error });
+      throw createError('Failed to fetch patients', 500);
+    }
+
+    const patients = (admissions || []).map((admission: any) => ({
+      admissionId: admission.id,
+      patientId: admission.patients?.id,
+      patientName: `${admission.patients?.first_name || ''} ${admission.patients?.last_name || ''}`.trim(),
+      bedId: admission.beds?.id,
+      bedNumber: admission.beds?.bed_number || 'N/A',
+      roomNumber: admission.beds?.rooms?.room_number || 'N/A',
+      roomType: admission.beds?.rooms?.room_type || 'N/A',
+      diagnosis: admission.diagnosis || 'Not specified',
+      status: admission.status,
+      admissionDate: admission.admission_date
+    }));
+
+    res.json({
+      success: true,
+      data: { patients }
+    });
+  } catch (error) {
+    logger.error('Failed to fetch nurse patients', { error, userId: req.user?.id });
+    throw createError('Failed to fetch patients', 500);
+  }
+}));
+
+// Get nurse's dashboard stats
+router.get('/nurse/stats', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (!req.user || !['nurse', 'admin'].includes(req.user.role)) {
+      throw createError('Access denied', 403);
+    }
+
+    // Count total active patients
+    const { count: activePatients } = await supabase
+      .from('admissions')
+      .select('*', { count: 'exact', head: true })
+      .in('status', ['admitted', 'under_treatment']);
+
+    // Count occupied beds
+    const { count: occupiedBeds } = await supabase
+      .from('beds')
+      .select('*', { count: 'exact', head: true })
+      .eq('is_available', false);
+
+    // Count available beds
+    const { count: availableBeds } = await supabase
+      .from('beds')
+      .select('*', { count: 'exact', head: true })
+      .eq('is_available', true);
+
+    // Count active medications (rough estimate - medications for active admissions)
+    const { count: activeMedications } = await supabase
+      .from('patient_medications')
+      .select('*', { count: 'exact', head: true })
+      .eq('status', 'active');
+
+    res.json({
+      success: true,
+      data: {
+        activePatients: activePatients || 0,
+        occupiedBeds: occupiedBeds || 0,
+        availableBeds: availableBeds || 0,
+        activeMedications: activeMedications || 0
+      }
+    });
+  } catch (error) {
+    logger.error('Failed to fetch nurse stats', { error, userId: req.user?.id });
+    throw createError('Failed to fetch nurse statistics', 500);
+  }
+}));
+
+// Get pending medication doses for nurse
+router.get('/nurse/medication-tasks', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (!req.user || !['nurse', 'admin'].includes(req.user.role)) {
+      throw createError('Access denied', 403);
+    }
+
+    // Get active medications with patient info
+    const { data: medications, error } = await supabase
+      .from('patient_medications')
+      .select(`
+        id,
+        medication_name,
+        dosage,
+        frequency,
+        route,
+        start_date,
+        end_date,
+        status,
+        admissions:admission_id (
+          id,
+          patients:patient_id (
+            id,
+            first_name,
+            last_name
+          ),
+          beds:bed_id (
+            bed_number,
+            rooms:room_id (
+              room_number
+            )
+          )
+        )
+      `)
+      .eq('status', 'active')
+      .order('start_date', { ascending: false })
+      .limit(20);
+
+    if (error) {
+      logger.error('Failed to fetch medication tasks', { error });
+      throw createError('Failed to fetch medication tasks', 500);
+    }
+
+    const tasks = (medications || []).map((med: any) => ({
+      medicationId: med.id,
+      medicationName: med.medication_name,
+      dosage: med.dosage,
+      frequency: med.frequency,
+      route: med.route,
+      patientName: `${med.admissions?.patients?.first_name || ''} ${med.admissions?.patients?.last_name || ''}`.trim(),
+      bedNumber: med.admissions?.beds?.bed_number || 'N/A',
+      roomNumber: med.admissions?.beds?.rooms?.room_number || 'N/A',
+      startDate: med.start_date,
+      endDate: med.end_date
+    }));
+
+    res.json({
+      success: true,
+      data: { tasks }
+    });
+  } catch (error) {
+    logger.error('Failed to fetch medication tasks', { error, userId: req.user?.id });
+    throw createError('Failed to fetch medication tasks', 500);
+  }
+}));
+
 export default router;

@@ -12,6 +12,36 @@ const supabase = createClient(
 
 const MEDICATION_SELECT = '*';
 
+const attachCatalogDetails = async (medications: any[]) => {
+  const catalogIds = Array.from(
+    new Set(
+      medications
+        .map((med) => med.medication_catalog_id)
+        .filter((id): id is string => Boolean(id))
+    )
+  );
+
+  if (!catalogIds.length) {
+    return medications;
+  }
+
+  const { data: catalogEntries, error } = await supabase
+    .from('medication_catalog')
+    .select('*')
+    .in('id', catalogIds);
+
+  if (error) {
+    logger.error('Failed to hydrate medication catalog entries', { error });
+    return medications;
+  }
+
+  const catalogMap = new Map((catalogEntries ?? []).map((entry) => [entry.id, entry]));
+  return medications.map((med) => ({
+    ...med,
+    medication_catalog: med.medication_catalog_id ? catalogMap.get(med.medication_catalog_id) ?? null : null,
+  }));
+};
+
 const refreshMedicationDoseStats = async (medicationId: string) => {
   const { data: doses, error: dosesError } = await supabase
     .from('patient_medication_doses')
@@ -70,7 +100,9 @@ const refreshMedicationDoseStats = async (medicationId: string) => {
     throw createError('Failed to update medication after dosing', 500);
   }
 
-  return updatedMedication;
+  const [hydratedMedication] = await attachCatalogDetails([updatedMedication]);
+
+  return hydratedMedication ?? updatedMedication;
 };
 
 // Get medications by patient ID with optional admission filter
@@ -101,9 +133,11 @@ router.get('/patient/:patientId', authenticateToken, asyncHandler(async (req: Au
     throw createError('Failed to fetch patient medications', 500);
   }
 
+  const hydrated = await attachCatalogDetails(data ?? []);
+
   res.json({
     success: true,
-    data: { medications: data ?? [] }
+    data: { medications: hydrated }
   });
 }));
 
@@ -150,9 +184,28 @@ router.post('/', authenticateToken, requireMedicalStaff, asyncHandler(async (req
     throw createError('patient_id, name, dosage, and frequency are required', 400);
   }
 
-  const pricePerUnit = price_per_unit !== undefined ? Number(price_per_unit) : 0;
-  const unitsPerDose = units_per_dose !== undefined ? Number(units_per_dose) : 1;
+  let pricePerUnit = price_per_unit !== undefined ? Number(price_per_unit) : undefined;
+  let unitsPerDose = units_per_dose !== undefined ? Number(units_per_dose) : undefined;
   const totalDoses = total_doses !== undefined ? Number(total_doses) : null;
+
+  if ((!Number.isFinite(pricePerUnit) || pricePerUnit === undefined) && medication_catalog_id) {
+    const { data: catalog } = await supabase
+      .from('medication_catalog')
+      .select('price_per_unit, default_units_per_dose')
+      .eq('id', medication_catalog_id)
+      .maybeSingle();
+    if (catalog) {
+      pricePerUnit = Number(catalog.price_per_unit ?? 0);
+      unitsPerDose = unitsPerDose ?? Number(catalog.default_units_per_dose ?? 1);
+    }
+  }
+
+  if (!Number.isFinite(pricePerUnit)) {
+    pricePerUnit = 0;
+  }
+  if (!Number.isFinite(unitsPerDose)) {
+    unitsPerDose = 1;
+  }
 
   const { data, error } = await supabase
     .from('patient_medications')
@@ -183,6 +236,8 @@ router.post('/', authenticateToken, requireMedicalStaff, asyncHandler(async (req
     throw createError('Failed to create medication', 500);
   }
 
+  const [hydratedMedication] = await attachCatalogDetails([data]);
+
   logger.info('Medication created', {
     medicationId: data.id,
     patientId: patient_id,
@@ -191,7 +246,7 @@ router.post('/', authenticateToken, requireMedicalStaff, asyncHandler(async (req
 
   res.status(201).json({
     success: true,
-    data: { medication: data }
+    data: { medication: hydratedMedication ?? data }
   });
 }));
 
@@ -242,6 +297,8 @@ router.put('/:id', authenticateToken, requireMedicalStaff, asyncHandler(async (r
     throw createError('Medication not found or update failed', 404);
   }
 
+  const [hydratedMedication] = await attachCatalogDetails([data]);
+
   logger.info('Medication updated', {
     medicationId: data.id,
     updatedBy: req.user!.staff_id
@@ -249,7 +306,7 @@ router.put('/:id', authenticateToken, requireMedicalStaff, asyncHandler(async (r
 
   res.json({
     success: true,
-    data: { medication: data }
+    data: { medication: hydratedMedication ?? data }
   });
 }));
 
@@ -259,7 +316,23 @@ router.get('/:id/doses', authenticateToken, asyncHandler(async (req: Authenticat
 
   const { data, error } = await supabase
     .from('patient_medication_doses')
-    .select('*')
+    .select(`
+      id,
+      patient_medication_id,
+      administered_at,
+      administered_by,
+      units_administered,
+      notes,
+      dose_number,
+      created_at,
+      staff:administered_by (
+        id,
+        first_name,
+        last_name,
+        role,
+        employment_role
+      )
+    `)
     .eq('patient_medication_id', id)
     .order('administered_at', { ascending: false });
 

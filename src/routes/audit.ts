@@ -3,8 +3,7 @@ import { createClient } from '@supabase/supabase-js';
 import { asyncHandler, createError } from '../middlewares/errorHandler.js';
 import { authenticateToken, requireAdmin, AuthenticatedRequest } from '../middlewares/auth.js';
 import { logger } from '../utils/logger.js';
-import { generateAuditReport } from '../utils/auditReport.js';
-import { uploadToR2 } from '../utils/r2.js';
+import { generatePatientAuditPDF, generateAdmissionAuditPDF } from '../utils/pdf-generator.js';
 
 const router = Router();
 const supabase = createClient(
@@ -12,240 +11,253 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-// Get audit reports history (Admin only)
-router.get('/reports', authenticateToken, requireAdmin, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const { data, error } = await supabase
-    .from('audit_reports')
-    .select('*')
-    .order('created_at', { ascending: false });
+router.post('/patient-audit', authenticateToken, requireAdmin, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const { dateFrom, dateTo } = req.body;
 
-  if (error) {
-    throw createError('Failed to fetch audit reports', 500);
+  if (!dateFrom || !dateTo) {
+    throw createError('dateFrom and dateTo are required', 400);
   }
 
-  res.json({
-    success: true,
-    data: { reports: data }
-  });
-}));
-
-// Generate new audit report (Admin only)
-router.post('/generate', authenticateToken, requireAdmin, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const { start_date, end_date, report_type = 'comprehensive' } = req.body;
-
-  if (!start_date || !end_date) {
-    throw createError('Start date and end date are required', 400);
-  }
-
-  const startDate = new Date(start_date);
-  const endDate = new Date(end_date);
+  const startDate = new Date(dateFrom);
+  const endDate = new Date(dateTo);
+  endDate.setHours(23, 59, 59, 999);
 
   if (startDate >= endDate) {
-    throw createError('Start date must be before end date', 400);
+    throw createError('dateFrom must be before dateTo', 400);
   }
 
-  // Check if report already exists for this date range
-  const { data: existingReport } = await supabase
-    .from('audit_reports')
-    .select('id')
-    .eq('start_date', start_date)
-    .eq('end_date', end_date)
-    .eq('report_type', report_type)
-    .single();
-
-  if (existingReport) {
-    throw createError('Audit report already exists for this date range', 409);
-  }
-
-  try {
-    // Generate report data (only patients with include_in_audit = true)
-    const reportData = await generateAuditReportData(startDate, endDate);
-    
-    // Generate PDF report
-    const pdfBuffer = await generateAuditReport(reportData, {
-      startDate,
-      endDate,
-      reportType: report_type,
-      generatedBy: req.user!.email,
-      hospitalName: process.env.HOSPITAL_NAME || 'Ashwini General Hospital'
-    });
-
-    // Upload to R2
-    const fileName = `audit-reports/${report_type}-${start_date}-to-${end_date}-${Date.now()}.pdf`;
-    const fileUrl = await uploadToR2(pdfBuffer, fileName, 'application/pdf');
-
-    // Save report record
-    const { data: reportRecord, error: saveError } = await supabase
-      .from('audit_reports')
-      .insert({
-        report_type,
-        start_date,
-        end_date,
-        file_url: fileUrl,
-        file_name: fileName,
-        patient_count: reportData.patients.length,
-        admission_count: reportData.admissions.length,
-        total_revenue: reportData.totalRevenue,
-        generated_by: req.user!.staff_id,
-        status: 'completed'
-      })
-      .select()
-      .single();
-
-    if (saveError) {
-      throw createError('Failed to save audit report record', 500);
-    }
-
-    // Log audit action
-    await logAuditAction({
-      action: 'AUDIT_REPORT_GENERATED',
-      details: {
-        reportId: reportRecord.id,
-        reportType: report_type,
-        dateRange: { start_date, end_date },
-        patientCount: reportData.patients.length,
-        totalRevenue: reportData.totalRevenue
-      },
-      performedBy: req.user!.staff_id!
-    });
-
-    logger.info('Audit report generated', {
-      reportId: reportRecord.id,
-      dateRange: { start_date, end_date },
-      generatedBy: req.user!.staff_id
-    });
-
-    res.json({
-      success: true,
-      data: { report: reportRecord }
-    });
-
-  } catch (error) {
-    logger.error('Failed to generate audit report', {
-      error: error.message,
-      dateRange: { start_date, end_date },
-      userId: req.user!.id
-    });
-    throw createError('Failed to generate audit report', 500);
-  }
-}));
-
-// Get audit report by ID (Admin only)
-router.get('/reports/:id', authenticateToken, requireAdmin, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const { data, error } = await supabase
-    .from('audit_reports')
-    .select('*')
-    .eq('id', req.params.id)
-    .single();
-
-  if (error || !data) {
-    throw createError('Audit report not found', 404);
-  }
-
-  res.json({
-    success: true,
-    data: { report: data }
-  });
-}));
-
-// Get audit logs (Admin only)
-router.get('/logs', authenticateToken, requireAdmin, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const page = parseInt(req.query.page as string) || 1;
-  const limit = parseInt(req.query.limit as string) || 50;
-  const offset = (page - 1) * limit;
-
-  const { data, error, count } = await supabase
-    .from('audit_logs')
-    .select('*, staff(name)', { count: 'exact' })
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
-
-  if (error) {
-    throw createError('Failed to fetch audit logs', 500);
-  }
-
-  res.json({
-    success: true,
-    data: {
-      logs: data,
-      pagination: {
-        page,
-        limit,
-        total: count,
-        pages: Math.ceil((count || 0) / limit)
-      }
-    }
-  });
-}));
-
-// Helper function to generate audit report data
-async function generateAuditReportData(startDate: Date, endDate: Date) {
-  // Get patients with include_in_audit = true
   const { data: patients, error: patientsError } = await supabase
     .from('patients')
     .select('*')
     .eq('include_in_audit', true)
     .gte('created_at', startDate.toISOString())
-    .lte('created_at', endDate.toISOString());
+    .lte('created_at', endDate.toISOString())
+    .order('created_at', { ascending: true });
 
   if (patientsError) {
-    throw new Error('Failed to fetch patients for audit');
+    logger.error('Failed to fetch patients for audit', { error: patientsError });
+    throw createError('Failed to fetch patients for audit', 500);
   }
 
-  // Get admissions for these patients
-  const patientIds = patients.map(p => p.id);
+  if (!patients || patients.length === 0) {
+    throw createError('No patients found for the specified date range with include_in_audit=true', 404);
+  }
+
+  const createdByIds = Array.from(new Set(patients.map((p) => p.created_by).filter(Boolean)));
+
+  const { data: staffMembers, error: staffError } = createdByIds.length
+    ? await supabase
+        .from('staff')
+        .select('id, first_name, last_name')
+        .in('id', createdByIds)
+    : { data: [], error: null };
+
+  if (staffError) {
+    logger.error('Failed to resolve staff for patient audit', { error: staffError });
+    throw createError('Failed to resolve staff details for audit', 500);
+  }
+
+  const staffMap = new Map(
+    (staffMembers ?? []).map((member) => {
+      const fullName =
+        `${member.first_name ?? ''} ${member.last_name ?? ''}`.trim() || 'Unknown Staff';
+      return [member.id, { id: member.id, name: fullName }];
+    })
+  );
+
+  const patientsWithStaff = patients.map((patient) => ({
+    ...patient,
+    staff: patient.created_by ? staffMap.get(patient.created_by) ?? null : null,
+  }));
+
+  const generatedBy = req.user?.email || 'Admin';
+
+  const pdfBuffer = await generatePatientAuditPDF({
+    patients: patientsWithStaff,
+    dateFrom,
+    dateTo,
+    generatedBy,
+  });
+
+  const fileName = `Patient_Audit_${dateFrom}_to_${dateTo}.pdf`;
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+  res.setHeader('Content-Length', pdfBuffer.length);
+
+  logger.info('Patient audit PDF generated', {
+    dateFrom,
+    dateTo,
+    patientCount: patientsWithStaff.length,
+    generatedBy: req.user?.staff_id,
+  });
+
+  res.send(pdfBuffer);
+}));
+
+router.post('/admission-audit', authenticateToken, requireAdmin, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const { dateFrom, dateTo } = req.body;
+
+  if (!dateFrom || !dateTo) {
+    throw createError('dateFrom and dateTo are required', 400);
+  }
+
+  const startDate = new Date(dateFrom);
+  const endDate = new Date(dateTo);
+  endDate.setHours(23, 59, 59, 999);
+
+  if (startDate >= endDate) {
+    throw createError('dateFrom must be before dateTo', 400);
+  }
+
   const { data: admissions, error: admissionsError } = await supabase
     .from('admissions')
     .select(`
-      *,
-      patients!inner(id, name, patient_id, include_in_audit),
-      rooms(name, room_type, rate_per_day)
+      id,
+      admission_date,
+      discharge_date,
+      status,
+      doctor_id,
+      include_in_audit,
+      created_at,
+      patients!inner(
+        id,
+        patient_id,
+        first_name,
+        last_name,
+        include_in_audit
+      ),
+      rooms(room_number, room_type)
     `)
-    .in('patient_id', patientIds)
-    .gte('admission_date', startDate.toISOString())
-    .lte('admission_date', endDate.toISOString());
+    .eq('include_in_audit', true)
+    .eq('patients.include_in_audit', true)
+    .gte('created_at', startDate.toISOString())
+    .lte('created_at', endDate.toISOString())
+    .order('created_at', { ascending: true });
 
   if (admissionsError) {
-    throw new Error('Failed to fetch admissions for audit');
+    logger.error('Failed to fetch admissions for audit', { error: admissionsError });
+    throw createError('Failed to fetch admissions for audit', 500);
   }
 
-  // Get billing data
-  const admissionIds = admissions.map(a => a.id);
-  const { data: charges, error: chargesError } = await supabase
-    .from('charges')
-    .select('*')
-    .in('admission_id', admissionIds);
-
-  if (chargesError) {
-    throw new Error('Failed to fetch charges for audit');
+  if (!admissions || admissions.length === 0) {
+    throw createError('No admissions found for the specified date range with include_in_audit=true', 404);
   }
 
-  // Calculate total revenue
-  const totalRevenue = charges.reduce((sum, charge) => sum + (charge.amount || 0), 0);
+  const staffIds = Array.from(new Set(admissions.map((admission) => admission.doctor_id).filter(Boolean)));
 
-  return {
-    patients,
-    admissions,
-    charges,
-    totalRevenue,
-    dateRange: { startDate, endDate }
-  };
-}
+  const { data: staffMembers, error: staffError } = staffIds.length
+    ? await supabase
+        .from('staff')
+        .select('id, first_name, last_name')
+        .in('id', staffIds)
+    : { data: [], error: null };
 
-// Helper function to log audit actions
-async function logAuditAction(logData: {
-  action: string;
-  details: any;
-  performedBy: string;
-}) {
-  await supabase
-    .from('audit_logs')
-    .insert({
-      action: logData.action,
-      details: logData.details,
-      performed_by: logData.performedBy,
-      timestamp: new Date().toISOString()
-    });
-}
+  if (staffError) {
+    logger.error('Failed to resolve staff for audit admissions', { error: staffError });
+    throw createError('Failed to resolve staff details for audit', 500);
+  }
+
+  const staffMap = new Map(
+    (staffMembers ?? []).map((member) => {
+      const fullName =
+        `${member.first_name ?? ''} ${member.last_name ?? ''}`.trim() || 'Unknown Staff';
+      return [member.id, { id: member.id, name: fullName }];
+    })
+  );
+
+  const admissionsWithStaff = admissions.map((admission) => ({
+    ...admission,
+    doctor_staff: admission.doctor_id ? staffMap.get(admission.doctor_id) ?? null : null,
+  }));
+
+  const generatedBy = req.user?.email || 'Admin';
+
+  const pdfBuffer = await generateAdmissionAuditPDF({
+    admissions: admissionsWithStaff,
+    dateFrom,
+    dateTo,
+    generatedBy,
+  });
+
+  const fileName = `Admission_Audit_${dateFrom}_to_${dateTo}.pdf`;
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+  res.setHeader('Content-Length', pdfBuffer.length);
+
+  logger.info('Admission audit PDF generated', {
+    dateFrom,
+    dateTo,
+    admissionCount: admissions.length,
+    generatedBy: req.user?.staff_id,
+  });
+
+  res.send(pdfBuffer);
+}));
+
+router.patch('/patients/:id/audit-status', authenticateToken, requireAdmin, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  const { include_in_audit } = req.body;
+
+  if (typeof include_in_audit !== 'boolean') {
+    throw createError('include_in_audit must be a boolean', 400);
+  }
+
+  const { data, error } = await supabase
+    .from('patients')
+    .update({ include_in_audit, updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) {
+    logger.error('Failed to update patient audit status', { error, patientId: id });
+    throw createError('Failed to update patient audit status', 500);
+  }
+
+  logger.info('Patient audit status updated', {
+    patientId: id,
+    include_in_audit,
+    updatedBy: req.user?.staff_id,
+  });
+
+  res.json({
+    success: true,
+    data: { patient: data },
+  });
+}));
+
+router.patch('/admissions/:id/audit-status', authenticateToken, requireAdmin, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  const { include_in_audit } = req.body;
+
+  if (typeof include_in_audit !== 'boolean') {
+    throw createError('include_in_audit must be a boolean', 400);
+  }
+
+  const { data, error } = await supabase
+    .from('admissions')
+    .update({ include_in_audit, updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) {
+    logger.error('Failed to update admission audit status', { error, admissionId: id });
+    throw createError('Failed to update admission audit status', 500);
+  }
+
+  logger.info('Admission audit status updated', {
+    admissionId: id,
+    include_in_audit,
+    updatedBy: req.user?.staff_id,
+  });
+
+  res.json({
+    success: true,
+    data: { admission: data },
+  });
+}));
 
 export default router;

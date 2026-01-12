@@ -83,18 +83,23 @@ const findAuthUserByEmail = async (email?: string | null) => {
 
   const normalizedEmail = email.toLowerCase().trim();
 
-  const { data, error } = await supabase
-    .from('auth.users')
-    .select('id, email')
-    .eq('email', normalizedEmail)
-    .maybeSingle();
+  try {
+    const { data, error } = await supabase.auth.admin.listUsers();
 
-  if (error) {
+    if (error) {
+      logger.error('Failed to list auth users', { error });
+      throw createError('Unable to verify existing portal accounts', 500);
+    }
+
+    const existingUser = data.users.find(
+      (user) => user.email?.toLowerCase().trim() === normalizedEmail
+    );
+
+    return existingUser ? { id: existingUser.id, email: existingUser.email } : null;
+  } catch (error) {
     logger.error('Failed to lookup auth user by email', { email: normalizedEmail, error });
     throw createError('Unable to verify existing portal accounts', 500);
   }
-
-  return data ?? null;
 };
 
 const PORTAL_ROLES = ['admin', 'doctor', 'nurse', 'billing', 'reception'];
