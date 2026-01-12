@@ -5,7 +5,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { asyncHandler, createError } from '../middlewares/errorHandler.js';
 import { authenticateToken, requireReception, AuthenticatedRequest } from '../middlewares/auth.js';
 import { logger } from '../utils/logger.js';
-import { env } from '../config/env';
+import { env } from '../config/env.js';
 
 const router = Router();
 const supabase = createClient(
