@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { errorHandler } from './middlewares/errorHandler.js';
 import { logger } from './utils/logger.js';
+import { env } from './config/env.js';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -33,12 +34,20 @@ dotenv.config();
 
 const app = express();
 
+const defaultDevOrigins = ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:3001'];
+const defaultProdOrigins = ['https://ashwinihospital.com', 'https://app.ashwinigeneralhospital.com'];
+
+const corsOrigins =
+  env.CORS_ALLOWED_ORIGINS.length > 0
+    ? env.CORS_ALLOWED_ORIGINS
+    : process.env.NODE_ENV === 'production'
+      ? defaultProdOrigins
+      : defaultDevOrigins;
+
 // Security middleware
 app.use(helmet());
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production' 
-    ? ['https://ashwinihospital.com'] 
-    : ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:3001'],
+  origin: corsOrigins,
   credentials: true
 }));
 

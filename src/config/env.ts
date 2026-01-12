@@ -2,6 +2,14 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+const parseOrigins = (value?: string | null) =>
+  value
+    ? value
+        .split(',')
+        .map((origin) => origin.trim())
+        .filter(Boolean)
+    : [];
+
 export const env = {
   // Database
   SUPABASE_URL: process.env.SUPABASE_URL!,
@@ -39,5 +47,8 @@ export const env = {
   // Seed Admin
   SEED_ADMIN_NAME: process.env.SEED_ADMIN_NAME || 'Ashwini Super Admin',
   SEED_ADMIN_EMAIL: process.env.SEED_ADMIN_EMAIL || 'admin@ashwinihospital.com',
-  SEED_ADMIN_PASSWORD: process.env.SEED_ADMIN_PASSWORD || 'Admin@123'
+  SEED_ADMIN_PASSWORD: process.env.SEED_ADMIN_PASSWORD || 'Admin@123',
+
+  // CORS
+  CORS_ALLOWED_ORIGINS: parseOrigins(process.env.CORS_ALLOWED_ORIGINS)
 };
