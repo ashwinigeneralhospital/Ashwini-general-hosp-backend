@@ -350,6 +350,7 @@ router.get('/:id/doses', authenticateToken, asyncHandler(async (req: Authenticat
 // Log a dose administered for a medication
 router.post('/:id/doses', authenticateToken, requireMedicalStaff, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
+  const medicationId = Array.isArray(id) ? id[0] : id;
   const { units_administered, notes, administered_at } = req.body;
 
   const units = units_administered !== undefined ? Number(units_administered) : 1;
@@ -357,7 +358,7 @@ router.post('/:id/doses', authenticateToken, requireMedicalStaff, asyncHandler(a
   const { data: dose, error: doseError } = await supabase
     .from('patient_medication_doses')
     .insert({
-      patient_medication_id: id,
+      patient_medication_id: medicationId,
       administered_by: req.user!.staff_id,
       administered_at: administered_at || new Date().toISOString(),
       units_administered: units,
@@ -367,11 +368,11 @@ router.post('/:id/doses', authenticateToken, requireMedicalStaff, asyncHandler(a
     .single();
 
   if (doseError) {
-    logger.error('Failed to log medication dose', { medicationId: id, error: doseError.message });
+    logger.error('Failed to log medication dose', { medicationId, error: doseError.message });
     throw createError('Failed to log medication dose', 500);
   }
 
-  const updatedMedication = await refreshMedicationDoseStats(id);
+  const updatedMedication = await refreshMedicationDoseStats(medicationId);
 
   res.status(201).json({
     success: true,

@@ -12,6 +12,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
+const getParamValue = (value: string | string[]): string => (Array.isArray(value) ? value[0] : value);
+
 // Configure multer for file uploads (memory storage)
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -50,7 +52,7 @@ const LAB_REPORT_SELECT = `
 
 // Get lab reports by patient ID with optional admission filter
 router.get('/patient/:patientId', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const { patientId } = req.params;
+  const patientId = getParamValue(req.params.patientId);
   const admissionId = req.query.admissionId as string;
 
   let query = supabase
@@ -77,7 +79,7 @@ router.get('/patient/:patientId', authenticateToken, asyncHandler(async (req: Au
 
 // Get lab reports by admission ID
 router.get('/admission/:admissionId', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const { admissionId } = req.params;
+  const admissionId = getParamValue(req.params.admissionId);
 
   const { data, error } = await supabase
     .from('lab_reports')
@@ -198,6 +200,7 @@ router.post('/', authenticateToken, requireMedicalStaff, upload.single('pdf'), a
 
 // Update lab report with optional PDF upload
 router.put('/:id', authenticateToken, requireMedicalStaff, upload.single('pdf'), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const labReportId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const {
     test_type,
     test_date,
@@ -230,7 +233,7 @@ router.put('/:id', authenticateToken, requireMedicalStaff, upload.single('pdf'),
     const { data: existingReport } = await supabase
       .from('lab_reports')
       .select('patient_id, admission_id')
-      .eq('id', req.params.id)
+      .eq('id', labReportId)
       .single();
 
     if (existingReport) {
@@ -238,14 +241,14 @@ router.put('/:id', authenticateToken, requireMedicalStaff, upload.single('pdf'),
         const { url, path } = await uploadLabReportPDF(
           existingReport.patient_id,
           existingReport.admission_id || 'no-admission',
-          req.params.id,
+          labReportId,
           req.file.buffer
         );
 
         updateData.pdf_url = url;
         updateData.pdf_storage_path = path;
       } catch (uploadError: any) {
-        logger.error('Failed to upload PDF to R2', { error: uploadError.message, labReportId: req.params.id });
+        logger.error('Failed to upload PDF to R2', { error: uploadError.message, labReportId });
       }
     }
   }
@@ -253,7 +256,7 @@ router.put('/:id', authenticateToken, requireMedicalStaff, upload.single('pdf'),
   const { data, error } = await supabase
     .from('lab_reports')
     .update(updateData)
-    .eq('id', req.params.id)
+    .eq('id', labReportId)
     .select(LAB_REPORT_SELECT)
     .single();
 
@@ -318,10 +321,11 @@ router.get('/:id/pdf-url', authenticateToken, asyncHandler(async (req: Authentic
 
 // Delete lab report
 router.delete('/:id', authenticateToken, requireMedicalStaff, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const labReportId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const { data, error } = await supabase
     .from('lab_reports')
     .delete()
-    .eq('id', req.params.id)
+    .eq('id', labReportId)
     .select('id')
     .single();
 

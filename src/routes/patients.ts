@@ -13,6 +13,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
+const getParamValue = (value: string | string[]): string => (Array.isArray(value) ? value[0] : value);
+
 const r2 = new S3Client({
   region: 'auto',
   endpoint: `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -147,7 +149,7 @@ const PATIENT_WITH_RELATIONS = `
 
 // Get patient by ID or patient code
 router.get('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const identifier = req.params.id;
+  const identifier = getParamValue(req.params.id);
 
   const fetchPatient = async (column: 'id' | 'patient_id') => {
     const { data, error } = await supabase
@@ -271,10 +273,11 @@ router.post('/', authenticateToken, requireReception, asyncHandler(async (req: A
 
 // Delete patient
 router.delete('/:id', authenticateToken, requireReception, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const patientIdParam = getParamValue(req.params.id);
   const { data, error } = await supabase
     .from('patients')
     .delete()
-    .eq('id', req.params.id)
+    .eq('id', patientIdParam)
     .select('id')
     .single();
 
@@ -315,10 +318,11 @@ router.put('/:id', authenticateToken, requireReception, asyncHandler(async (req:
     include_in_audit
   } = req.body;
 
+  const patientIdParam = getParamValue(req.params.id);
   const { data: existingPatient, error: fetchError } = await supabase
     .from('patients')
     .select('*, aadhaar_url, pan_url')
-    .eq('id', req.params.id)
+    .eq('id', patientIdParam)
     .single();
 
   if (fetchError || !existingPatient) {
@@ -347,7 +351,7 @@ router.put('/:id', authenticateToken, requireReception, asyncHandler(async (req:
       include_in_audit,
       updated_at: new Date().toISOString()
     })
-    .eq('id', req.params.id)
+    .eq('id', patientIdParam)
     .select()
     .single();
 
@@ -395,10 +399,11 @@ router.patch('/:id/audit-inclusion', authenticateToken, requireReception, asyncH
       .single();
   };
 
-  let { data, error } = await updatePatient('id', req.params.id);
+  const identifier = getParamValue(req.params.id);
+  let { data, error } = await updatePatient('id', identifier);
 
-  if ((error || !data) && req.params.id.startsWith('P')) {
-    ({ data, error } = await updatePatient('patient_id', req.params.id));
+  if ((error || !data) && identifier.startsWith('P')) {
+    ({ data, error } = await updatePatient('patient_id', identifier));
   }
 
   if (error || !data) {
