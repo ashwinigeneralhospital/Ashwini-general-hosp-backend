@@ -260,7 +260,7 @@ router.post('/enable', authenticateToken, asyncHandler(async (req: Authenticated
 
   logger.info('TOTP 2FA enabled successfully', { userId });
 
-  res.json({
+  return res.json({
     success: true,
     message: '2FA enabled successfully',
     data: {
@@ -316,7 +316,7 @@ router.post('/email/send-code', authenticateToken, asyncHandler(async (req: Auth
 
   logger.info('Email OTP sent', { userId, purpose });
 
-  res.json({
+  return res.json({
     success: true,
     message: 'Verification code sent to your email',
     data: { expiresAt },
@@ -417,7 +417,7 @@ router.post('/disable', authenticateToken, asyncHandler(async (req: Authenticate
 
   logger.info('2FA disabled successfully', { userId });
 
-  res.json({
+  return res.json({
     success: true,
     message: '2FA disabled successfully',
   });
@@ -506,7 +506,7 @@ router.post('/admin/toggle/:targetUserId', authenticateToken, requireAdmin, asyn
 
     logger.info('Admin enabled 2FA for user', { targetUserId, adminId: req.user!.id });
 
-    res.json({
+    return res.json({
       success: true,
       message: '2FA enabled for user',
       data: {
@@ -535,7 +535,7 @@ router.post('/admin/toggle/:targetUserId', authenticateToken, requireAdmin, asyn
 
     logger.info('Admin disabled 2FA for user', { targetUserId, adminId: req.user!.id });
 
-    res.json({
+    return res.json({
       success: true,
       message: '2FA disabled for user',
     });
@@ -557,7 +557,7 @@ router.get('/status', authenticateToken, asyncHandler(async (req: AuthenticatedR
     throw createError('User not found', 404);
   }
 
-  res.json({
+  return res.json({
     success: true,
     data: {
       enabled: staffMember.two_factor_enabled || false,

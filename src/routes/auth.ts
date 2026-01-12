@@ -223,7 +223,7 @@ router.post('/login', asyncHandler(async (req: any, res: Response) => {
     staffId: staffData.id
   });
 
-  res.json({
+  return res.json({
     success: true,
     data: {
       user: {
@@ -242,7 +242,7 @@ router.post('/login', asyncHandler(async (req: any, res: Response) => {
 
 // Get current user profile
 router.get('/profile', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  res.json({
+  return res.json({
     success: true,
     data: {
       user: {
@@ -311,7 +311,7 @@ router.post('/reset-password', authenticateToken, asyncHandler(async (req: Authe
     email: req.user!.email
   });
 
-  res.json({
+  return res.json({
     success: true,
     message: 'Password updated successfully'
   });
@@ -331,7 +331,7 @@ router.post('/logout', authenticateToken, asyncHandler(async (req: Authenticated
     email: req.user!.email
   });
 
-  res.json({
+  return res.json({
     success: true,
     message: 'Logged out successfully'
   });
@@ -339,7 +339,7 @@ router.post('/logout', authenticateToken, asyncHandler(async (req: Authenticated
 
 // Verify token endpoint
 router.get('/verify', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  res.json({
+  return res.json({
     success: true,
     data: {
       user: req.user,
