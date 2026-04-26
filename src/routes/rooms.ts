@@ -35,7 +35,7 @@ const mapRoom = (room: any) => {
     ward: room.ward ?? null,
     block: room.block ?? null,
     bed_label: room.bed_label ?? null,
-    rate_per_day: room.rate_per_day,
+    rate_per_day: room.rate_per_day ?? null,
     status: room.status ?? (room.is_available ? 'available' : 'occupied'),
     is_available: room.is_available,
     needs_cleaning: room.needs_cleaning ?? false,
@@ -120,7 +120,6 @@ router.post('/', authenticateToken, requireAdmin, asyncHandler(async (req: Authe
     room_number,
     room_type,
     floor,
-    rate_per_day,
     ward,
     block,
     bed_label,
@@ -130,10 +129,6 @@ router.post('/', authenticateToken, requireAdmin, asyncHandler(async (req: Authe
 
   if (!room_number || !room_type || typeof floor !== 'number' || Number.isNaN(floor)) {
     throw createError('room_number, room_type, and floor are required', 400);
-  }
-
-  if (typeof rate_per_day !== 'number' || Number.isNaN(rate_per_day) || rate_per_day < 0) {
-    throw createError('rate_per_day is required and must be a valid number', 400);
   }
 
   if (!['available', 'occupied', 'cleaning', 'maintenance'].includes(status)) {
@@ -146,7 +141,6 @@ router.post('/', authenticateToken, requireAdmin, asyncHandler(async (req: Authe
       room_number,
       room_type,
       floor,
-      rate_per_day,
       ward,
       block,
       bed_label,
@@ -177,7 +171,6 @@ router.patch('/:id', authenticateToken, requireAdmin, asyncHandler(async (req: A
   const {
     room_type,
     floor,
-    rate_per_day,
     ward,
     block,
     bed_label,
@@ -192,13 +185,6 @@ router.patch('/:id', authenticateToken, requireAdmin, asyncHandler(async (req: A
 
   if (room_type !== undefined) updates.room_type = room_type;
   if (floor !== undefined) updates.floor = floor;
-  if (rate_per_day !== undefined) {
-    if (rate_per_day === null || typeof rate_per_day === 'number' && !Number.isNaN(rate_per_day)) {
-      updates.rate_per_day = rate_per_day;
-    } else {
-      throw createError('Invalid rate_per_day value', 400);
-    }
-  }
   if (ward !== undefined) updates.ward = ward;
   if (block !== undefined) updates.block = block;
   if (bed_label !== undefined) updates.bed_label = bed_label;
