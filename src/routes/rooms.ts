@@ -154,7 +154,11 @@ router.post('/', authenticateToken, requireAdmin, asyncHandler(async (req: Authe
     .single();
 
   if (error || !data) {
-    throw createError('Failed to create room', 500);
+    console.error('Supabase error creating room:', error);
+    if (error?.code === '23505') {
+      throw createError('Room with this room number already exists', 409);
+    }
+    throw createError(`Failed to create room: ${error?.message || 'Unknown error'}`, 500);
   }
 
   res.status(201).json({
