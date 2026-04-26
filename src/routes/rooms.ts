@@ -132,6 +132,10 @@ router.post('/', authenticateToken, requireAdmin, asyncHandler(async (req: Authe
     throw createError('room_number, room_type, and floor are required', 400);
   }
 
+  if (typeof rate_per_day !== 'number' || Number.isNaN(rate_per_day) || rate_per_day < 0) {
+    throw createError('rate_per_day is required and must be a valid number', 400);
+  }
+
   if (!['available', 'occupied', 'cleaning', 'maintenance'].includes(status)) {
     throw createError('Invalid room status', 400);
   }
@@ -142,7 +146,7 @@ router.post('/', authenticateToken, requireAdmin, asyncHandler(async (req: Authe
       room_number,
       room_type,
       floor,
-      rate_per_day: typeof rate_per_day === 'number' && !Number.isNaN(rate_per_day) ? rate_per_day : null,
+      rate_per_day,
       ward,
       block,
       bed_label,
