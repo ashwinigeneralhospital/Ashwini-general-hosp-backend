@@ -99,10 +99,26 @@ router.delete('/:id', authenticateToken, requireAdmin, asyncHandler(async (req: 
 
 router.post('/:id/send', authenticateToken, requireAdmin, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
-  const { to, subjectOverride, bodyOverride } = req.body;
+  const { to, recipients, subjectOverride, bodyOverride } = req.body;
 
-  if (!to) {
-    throw createError('Recipient email (to) is required', 400);
+  // Support both single 'to' and array 'recipients'
+  let emailList: string[] = [];
+  if (recipients && Array.isArray(recipients)) {
+    emailList = recipients.filter((e: string) => e && typeof e === 'string');
+  } else if (to) {
+    // Handle comma-separated emails
+    emailList = to.split(',').map((e: string) => e.trim()).filter((e: string) => e);
+  }
+
+  if (emailList.length === 0) {
+    throw createError('At least one recipient email is required', 400);
+  }
+
+  // Validate email format
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const invalidEmails = emailList.filter((e: string) => !emailRegex.test(e));
+  if (invalidEmails.length > 0) {
+    throw createError(`Invalid email addresses: ${invalidEmails.join(', ')}`, 400);
   }
 
   const { data: template, error } = await supabase
@@ -118,15 +134,36 @@ router.post('/:id/send', authenticateToken, requireAdmin, asyncHandler(async (re
   const subject = subjectOverride || template.subject;
   const body = bodyOverride || template.body;
 
-  await sendEmail({
-    to,
-    subject,
-    html: body,
+  // Send to all recipients
+  const results = await Promise.allSettled(
+    emailList.map((email: string) =>
+      sendEmail({
+        to: email,
+        subject,
+        html: body,
+      })
+    )
+  );
+
+  const succeeded = results.filter((r) => r.status === 'fulfilled').length;
+  const failed = results.filter((r) => r.status === 'rejected').length;
+
+  logger.info('Bulk email sent from template', {
+    templateId: id,
+    total: emailList.length,
+    succeeded,
+    failed,
   });
 
-  logger.info('Email sent from template', { templateId: id, to });
-
-  res.json({ success: true });
+  res.json({
+    success: true,
+    data: {
+      total: emailList.length,
+      succeeded,
+      failed,
+      invalidEmails: invalidEmails.length > 0 ? invalidEmails : undefined,
+    },
+  });
 }));
 
 export default router;

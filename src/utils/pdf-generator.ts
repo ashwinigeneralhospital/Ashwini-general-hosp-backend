@@ -56,6 +56,107 @@ const colors: ColorScheme = {
   border: '#bdc3c7',
 };
 
+// Letterhead layout constants (kept here so all pages share the same frame)
+const LETTERHEAD_HEADER_HEIGHT = 110;
+const LETTERHEAD_FOOTER_HEIGHT = 70;
+const LETTERHEAD_LINE_COLOR = '#1f4e79';
+
+const drawLetterheadFrame = (
+  doc: PDFKit.PDFDocument,
+  leftX: number,
+  contentWidth: number,
+  pageWidth: number,
+  pageHeight: number,
+): void => {
+  const logoPath = path.resolve(process.cwd(), 'public/logo.jpg');
+  const rightX = pageWidth - 35;
+
+  // Watermark logo (centered, low opacity, drawn first so it sits behind content)
+  if (fs.existsSync(logoPath)) {
+    try {
+      doc.save();
+      doc.opacity(0.06);
+      const wmSize = 320;
+      const wmX = (pageWidth - wmSize) / 2;
+      const wmY = (pageHeight - wmSize) / 2;
+      doc.image(logoPath, wmX, wmY, { width: wmSize, height: wmSize });
+      doc.restore();
+    } catch (err) {
+      logger.warn('Failed to render watermark logo', { error: err });
+    }
+  }
+
+  // Header logo (left side)
+  const headerTop = 25;
+  const logoSize = 70;
+  const logoX = leftX + 5;
+  if (fs.existsSync(logoPath)) {
+    try {
+      doc.image(logoPath, logoX, headerTop, { width: logoSize, height: logoSize });
+    } catch (err) {
+      logger.warn('Failed to render header logo', { error: err });
+    }
+  }
+
+  // Title block (centered next to logo)
+  const titleBlockX = leftX + logoSize + 15;
+  const titleBlockWidth = rightX - titleBlockX;
+
+  doc
+    .font('Helvetica-Bold')
+    .fontSize(22)
+    .fillColor('#000000')
+    .text(env.HOSPITAL_NAME || 'ASHWINI GENERAL HOSPITAL', titleBlockX, headerTop + 4, {
+      width: titleBlockWidth,
+      align: 'center',
+    });
+
+  doc
+    .font('Helvetica-Bold')
+    .fontSize(9)
+    .fillColor('#000000')
+    .text(
+      `E-mail id:-${env.HOSPITAL_EMAIL || ''} | Mobile No:- ${env.HOSPITAL_PHONE || ''}`,
+      titleBlockX,
+      headerTop + 36,
+      { width: titleBlockWidth, align: 'center' },
+    );
+
+  doc.text(
+    `Landline Number:- ${env.HOSPITAL_LANDLINE || ''} | ${env.HOSPITAL_EMERGENCY_INFO || 'Emergency 24x7'}`,
+    titleBlockX,
+    headerTop + 50,
+    { width: titleBlockWidth, align: 'center' },
+  );
+
+  // Decorative double blue lines at the bottom of header
+  const headerLineY = headerTop + logoSize + 12;
+  doc.strokeColor(LETTERHEAD_LINE_COLOR).lineWidth(1.5);
+  doc.moveTo(leftX, headerLineY).lineTo(rightX, headerLineY).stroke();
+  doc.lineWidth(0.6);
+  doc.moveTo(leftX, headerLineY + 4).lineTo(rightX, headerLineY + 4).stroke();
+
+  // Footer: double blue lines + centered address (matches image)
+  const footerLineY = pageHeight - 60;
+  doc.strokeColor(LETTERHEAD_LINE_COLOR).lineWidth(0.6);
+  doc.moveTo(leftX, footerLineY).lineTo(rightX, footerLineY).stroke();
+  doc.lineWidth(1.5);
+  doc.moveTo(leftX, footerLineY + 4).lineTo(rightX, footerLineY + 4).stroke();
+
+  doc
+    .font('Helvetica-Bold')
+    .fontSize(10)
+    .fillColor('#000000')
+    .text(env.HOSPITAL_FOOTER_ADDRESS, leftX, pageHeight - 45, {
+      width: contentWidth,
+      align: 'center',
+      lineGap: 2,
+    });
+
+  // Reset cursor in case caller relies on doc.y (kept for safety)
+  doc.fillColor(colors.text);
+};
+
 const drawMedicationSection = (
   doc: PDFKit.PDFDocument,
   data: InvoiceData,
@@ -104,10 +205,15 @@ const drawMedicationSection = (
 export const generateInvoicePDF = async (data: InvoiceData): Promise<Buffer> => {
   return new Promise((resolve, reject) => {
     try {
-      const doc = new PDFDocument({ 
-        margin: 35, 
+      const doc = new PDFDocument({
         size: 'A4',
-        bufferPages: true 
+        bufferPages: true,
+        margins: {
+          top: LETTERHEAD_HEADER_HEIGHT + 10,
+          bottom: LETTERHEAD_FOOTER_HEIGHT + 10,
+          left: 35,
+          right: 35,
+        },
       });
       const buffers: Buffer[] = [];
 
@@ -119,10 +225,15 @@ export const generateInvoicePDF = async (data: InvoiceData): Promise<Buffer> => 
       const rightX = pageWidth - doc.page.margins.right;
       const contentWidth = rightX - leftX;
 
-      let cursorY = doc.page.margins.top - 10;
+      let cursorY = LETTERHEAD_HEADER_HEIGHT + 5;
 
-      // Header
-      cursorY = drawHeader(doc, data, leftX, contentWidth, cursorY);
+      // Provisional bill title (kept compact so it fits below the letterhead header)
+      doc.font('Helvetica-Bold').fontSize(14).fillColor(colors.accent);
+      doc.text('PROVISIONAL BILL', leftX, cursorY, {
+        align: 'center',
+        width: contentWidth,
+      });
+      cursorY += 22;
 
       // Patient Info Section
       cursorY = drawPatientInfoSection(doc, data, leftX, contentWidth, cursorY);
@@ -139,17 +250,75 @@ export const generateInvoicePDF = async (data: InvoiceData): Promise<Buffer> => 
       // Totals Section
       cursorY = drawTotalsSectionOptimized(doc, data, leftX, contentWidth, cursorY);
 
-      // Footer
-      drawFooter(doc, data, leftX, contentWidth, pageWidth);
+      // Track expected pages before any drawing that might overflow
+      const expectedPages = data.admissionSummary ? 2 : 1;
 
       // Add admission summary page if provided
       if (data.admissionSummary) {
         drawAdmissionSummaryPage(doc, data, leftX, contentWidth, pageWidth);
       }
 
+      // Render letterhead frame (header + watermark + footer) on every page now
+      // that all content is laid out. Avoids recursive pageAdded by drawing after.
+      const range = doc.bufferedPageRange();
+      const actualPages = range.count;
+      
+      logger.info('PDF generation: page counts', {
+        expectedPages,
+        actualPages,
+        hasAdmissionSummary: !!data.admissionSummary,
+        rangeStart: range.start,
+        rangeCount: range.count
+      });
+      
+      for (let i = range.start; i < range.start + range.count; i++) {
+        doc.switchToPage(i);
+        
+        // Calculate which pages should have letterhead:
+        // - Page 1 always has the main invoice content
+        // - Page 2 only if admissionSummary was explicitly added
+        // - Any pages beyond expected are overflow pages - skip them
+        const pageIndex = i - range.start + 1; // 1-based page index
+        const isExpectedPage = pageIndex <= expectedPages;
+        const isAdmissionSummaryPage = data.admissionSummary && pageIndex === 2;
+        
+        logger.info('PDF generation: processing page', {
+          pageIndex,
+          isExpectedPage,
+          isAdmissionSummaryPage,
+          willDrawLetterhead: isExpectedPage
+        });
+        
+        if (isExpectedPage) {
+          drawLetterheadFrame(doc, leftX, contentWidth, doc.page.width, doc.page.height);
+        }
+      }
+      
+      // Log page count for debugging
+      if (actualPages > expectedPages) {
+        logger.info('PDF generation: content overflow created extra pages', {
+          expectedPages,
+          actualPages,
+          overflowPages: actualPages - expectedPages
+        });
+      }
+
+      doc.on('error', (streamError) => {
+        logger.error('PDFKit stream error', {
+          message: (streamError as Error)?.message,
+          stack: (streamError as Error)?.stack,
+        });
+        reject(streamError);
+      });
+
       doc.end();
     } catch (error) {
-      logger.error('PDF generation failed', { error });
+      const err = error as Error;
+      logger.error('PDF generation failed', {
+        message: err?.message,
+        name: err?.name,
+        stack: err?.stack,
+      });
       reject(error);
     }
   });
@@ -456,7 +625,7 @@ const drawTotalsSectionOptimized = (
   
   const calculatedPayable = subtotal + gst - discountAmount;
   const payable = Number(data.invoice.amount_payable || calculatedPayable);
-  const amountPaid = Number(data.invoice.amount_paid || 0);
+  const amountPaid = Number(data.invoice.paid_amount || 0);
   const balance = Number(data.invoice.balance || payable - amountPaid);
   
   const discountDisplay = discountType === 'percentage' ? `${discount}%` : formatCurrency(discount);
@@ -597,26 +766,8 @@ const drawAdmissionSummaryPage = (
 
   doc.addPage();
 
-  const logoPath = path.join(process.cwd(), 'public', 'logo.jpg');
-  let logoY = 35;
-  if (fs.existsSync(logoPath)) {
-    try {
-      doc.image(logoPath, leftX, logoY, { width: 50, height: 50 });
-    } catch (err) {
-      logger.warn('Failed to load logo for admission summary page', { error: err });
-    }
-  }
-
-  doc.font('Helvetica-Bold').fontSize(18).fillColor(colors.primary);
-  doc.text('ASHWINI GENERAL HOSPITAL', leftX + 60, logoY + 5, { width: contentWidth - 60 });
-  
-  doc.font('Helvetica').fontSize(9).fillColor(colors.text);
-  doc.text('Comprehensive Healthcare Services', leftX + 60, logoY + 25, { width: contentWidth - 60 });
-
-  doc.strokeColor(colors.border).lineWidth(2);
-  doc.moveTo(leftX, logoY + 60).lineTo(pageWidth - 35, logoY + 60).stroke();
-
-  let currentY = logoY + 80;
+  // Letterhead frame is auto-drawn by the pageAdded listener; start content below header
+  let currentY = LETTERHEAD_HEADER_HEIGHT + 10;
 
   doc.font('Helvetica-Bold').fontSize(16).fillColor(colors.primary);
   doc.text('TREATMENT SUMMARY', leftX, currentY, { width: contentWidth, align: 'center' });
@@ -686,21 +837,7 @@ const drawAdmissionSummaryPage = (
     currentY = doc.y + sectionSpacing;
   }
 
-  // Add footer at bottom of current page without creating new page
-  const bottomMargin = 60;
-  const footerY = doc.page.height - bottomMargin;
-  
-  // Only add footer if we have space, otherwise it's fine to skip
-  if (doc.y < footerY - 30) {
-    doc.strokeColor(colors.border).lineWidth(1);
-    doc.moveTo(leftX, footerY).lineTo(pageWidth - 35, footerY).stroke();
-
-    doc.font('Helvetica').fontSize(7).fillColor('#999');
-    doc.text(`Generated on: ${formatDateTime(new Date().toISOString())}`, leftX, footerY + 10, {
-      width: contentWidth,
-      align: 'center',
-    });
-  }
+  // Footer is rendered by the shared letterhead frame on every page.
 };
 
 const drawFooter = (

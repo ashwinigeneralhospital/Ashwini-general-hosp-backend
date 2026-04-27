@@ -48,6 +48,10 @@ router.get('/:invoiceId/pdf', authenticateToken, requireBilling, asyncHandler(as
   const { invoiceId } = req.params;
   const includeLabReports = req.query.includeLabReports === 'true';
   const includeSummary = req.query.includeSummary === 'true';
+  const overrideDoctorNameRaw = (req.query?.doctorName as string | undefined)?.trim();
+  const overrideDoctorName = overrideDoctorNameRaw && overrideDoctorNameRaw.length > 0
+    ? overrideDoctorNameRaw
+    : null;
 
   logger.info('PDF Download Request Received', {
     invoiceId,
@@ -119,6 +123,20 @@ router.get('/:invoiceId/pdf', authenticateToken, requireBilling, asyncHandler(as
     if (staff) {
       staffName = `${staff.first_name} ${staff.last_name}${staff.specialization ? ` (${staff.specialization})` : ''}`;
     }
+  }
+
+  // Apply admin-typed doctor override (takes precedence over fetched staff)
+  if (overrideDoctorName) {
+    staffName = overrideDoctorName;
+    logger.info('Using overridden doctor name for PDF', { invoiceId, staffName });
+  }
+
+  // Expose staff.name on admissions so the PDF generator's helpers can read it
+  if (invoiceWithRelations.admissions) {
+    invoiceWithRelations.admissions.staff = {
+      ...(invoiceWithRelations.admissions.staff || {}),
+      name: staffName,
+    };
   }
 
   try {
@@ -260,8 +278,14 @@ router.get('/:invoiceId/pdf', authenticateToken, requireBilling, asyncHandler(as
     res.send(pdfBuffer);
 
   } catch (error) {
-    logger.error('PDF generation failed', { invoiceId, error });
-    throw createError('Failed to generate PDF', 500);
+    const err = error as Error;
+    logger.error('PDF generation failed', {
+      invoiceId,
+      message: err?.message,
+      name: err?.name,
+      stack: err?.stack,
+    });
+    throw createError(`Failed to generate PDF: ${err?.message || 'unknown error'}`, 500);
   }
 }));
 

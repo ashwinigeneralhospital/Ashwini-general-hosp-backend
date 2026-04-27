@@ -969,8 +969,12 @@ router.get('/:id/details', authenticateToken, asyncHandler(async (req: Authentic
 // Generate PDF invoice using PDFKit
 router.get("/:id/pdf", authenticateToken, requireBilling, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
+  const overrideDoctorNameRaw = (req.query?.doctorName as string | undefined)?.trim();
+  const overrideDoctorName = overrideDoctorNameRaw && overrideDoctorNameRaw.length > 0
+    ? overrideDoctorNameRaw
+    : null;
 
-  logger.info("Generating PDF for invoice", { invoiceId: id });
+  logger.info("Generating PDF for invoice", { invoiceId: id, hasDoctorOverride: !!overrideDoctorName });
 
   const { data: invoice, error: invoiceError } = await supabase
     .from("invoices")
@@ -1024,6 +1028,12 @@ router.get("/:id/pdf", authenticateToken, requireBilling, asyncHandler(async (re
     }
   } else {
     logger.warn('No doctor_id in admission data', { admissionData });
+  }
+
+  // Apply override (admin-typed doctor name) if provided
+  if (overrideDoctorName) {
+    staffName = overrideDoctorName;
+    logger.info('Using overridden doctor name for PDF', { staffName });
   }
 
   // Calculate room charges based on admission duration and room type
@@ -1680,6 +1690,17 @@ router.patch('/:id/status', authenticateToken, requireBilling, asyncHandler(asyn
     throw createError('status is required', 400);
   }
 
+  // Fetch current invoice to calculate amounts
+  const { data: currentInvoice, error: fetchError } = await supabase
+    .from('invoices')
+    .select('total_amount, paid_amount, discount_type, discount_value, include_gst, gst_rate, gst_amount')
+    .eq('id', id)
+    .single();
+
+  if (fetchError || !currentInvoice) {
+    throw createError('Invoice not found', 404);
+  }
+
   const updateData: Record<string, any> = {
     status,
     updated_at: new Date().toISOString(),
@@ -1705,6 +1726,32 @@ router.patch('/:id/status', authenticateToken, requireBilling, asyncHandler(asyn
   if (discount_value !== undefined) updateData.discount_value = discount_value !== null ? Number(discount_value) : null;
   if (discount_reason !== undefined) updateData.discount_reason = discount_reason || null;
 
+  // Calculate amount_payable and balance
+  const totalAmount = currentInvoice.total_amount;
+  const discountTypeFinal = updateData.discount_type ?? currentInvoice.discount_type;
+  const discountValueFinal = updateData.discount_value ?? currentInvoice.discount_value ?? 0;
+  const includeGstFinal = updateData.include_gst ?? currentInvoice.include_gst ?? false;
+  const gstRateFinal = updateData.gst_rate ?? currentInvoice.gst_rate ?? 18.00;
+
+  // Calculate discounted amount
+  let discountedAmount = totalAmount;
+  if (discountTypeFinal === 'percentage' && discountValueFinal > 0) {
+    discountedAmount = totalAmount * (1 - (discountValueFinal / 100));
+  } else if (discountTypeFinal === 'fixed' && discountValueFinal > 0) {
+    discountedAmount = Math.max(0, totalAmount - discountValueFinal);
+  }
+
+  // Calculate GST and payable
+  const gstAmount = includeGstFinal ? (discountedAmount * gstRateFinal / 100) : 0;
+  const amountPayable = discountedAmount + gstAmount;
+
+  // Calculate balance
+  const paidAmount = paidAmountValue !== undefined ? paidAmountValue : (currentInvoice.paid_amount || 0);
+  const balance = Math.max(0, amountPayable - paidAmount);
+
+  updateData.amount_payable = amountPayable;
+  updateData.balance = balance;
+
   const { data: updatedInvoice, error } = await supabase
     .from('invoices')
     .update(updateData)
@@ -1719,7 +1766,9 @@ router.patch('/:id/status', authenticateToken, requireBilling, asyncHandler(asyn
   logger.info('Invoice payment status updated', {
     invoiceId: id,
     status,
-    paid_amount: paidAmountValue,
+    paid_amount: paidAmount,
+    amount_payable: amountPayable,
+    balance,
     include_gst: updateData.include_gst,
     discount_type: updateData.discount_type,
     discount_value: updateData.discount_value,
