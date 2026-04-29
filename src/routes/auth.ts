@@ -203,7 +203,7 @@ router.post('/login', asyncHandler(async (req: any, res: Response) => {
     }
   }
 
-  // Generate JWT token
+  // Generate JWT access token (24h)
   const tokenPayload = {
     id: staffData.id,
     email: staffData.email,
@@ -215,6 +215,26 @@ router.post('/login', asyncHandler(async (req: any, res: Response) => {
     expiresIn: '24h',
     issuer: 'ashwini-hospital-backend'
   });
+
+  // Generate refresh token (7 days)
+  const refreshTokenPayload = {
+    id: staffData.id,
+    type: 'refresh'
+  };
+  const refreshToken = jwt.sign(refreshTokenPayload, env.JWT_SECRET, { 
+    expiresIn: '7d',
+    issuer: 'ashwini-hospital-backend'
+  });
+
+  // Store refresh token in database
+  const refreshTokenExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+  await supabase
+    .from('staff')
+    .update({
+      refresh_token: refreshToken,
+      refresh_token_expires_at: refreshTokenExpiresAt.toISOString()
+    })
+    .eq('id', staffData.id);
 
   // Log successful login
   logger.info('User logged in successfully', {
@@ -235,7 +255,8 @@ router.post('/login', asyncHandler(async (req: any, res: Response) => {
         staff_id: staffData.id,
         requires_password_reset: staffData.requires_password_reset
       },
-      token: token
+      token: token,
+      refreshToken: refreshToken
     }
   });
 }));
@@ -317,10 +338,134 @@ router.post('/reset-password', authenticateToken, asyncHandler(async (req: Authe
   });
 }));
 
+// Refresh token endpoint
+router.post('/refresh', asyncHandler(async (req: any, res: Response) => {
+  const { refreshToken } = req.body;
+
+  if (!refreshToken) {
+    throw createError('Refresh token is required', 400);
+  }
+
+  try {
+    // Verify refresh token
+    const decoded = jwt.verify(refreshToken, env.JWT_SECRET, {
+      issuer: 'ashwini-hospital-backend'
+    }) as { id: string; type: string };
+
+    if (decoded.type !== 'refresh') {
+      throw createError('Invalid refresh token', 401);
+    }
+
+    // Get staff record with refresh token
+    const { data: staffData, error: staffError } = await supabase
+      .from('staff')
+      .select('id, email, role, first_name, last_name, department, refresh_token, refresh_token_expires_at, is_active')
+      .eq('id', decoded.id)
+      .single();
+
+    if (staffError || !staffData) {
+      throw createError('Invalid refresh token', 401);
+    }
+
+    // Check if account is active
+    if (!staffData.is_active) {
+      throw createError('Account is inactive', 403);
+    }
+
+    // Check if refresh token matches and is not expired
+    if (staffData.refresh_token !== refreshToken) {
+      throw createError('Invalid refresh token', 401);
+    }
+
+    if (staffData.refresh_token_expires_at && new Date(staffData.refresh_token_expires_at) < new Date()) {
+      // Clear expired refresh token
+      await supabase
+        .from('staff')
+        .update({ refresh_token: null, refresh_token_expires_at: null })
+        .eq('id', staffData.id);
+      throw createError('Refresh token has expired', 401);
+    }
+
+    const fullName = [staffData.first_name, staffData.last_name]
+      .map((part) => (typeof part === 'string' ? part.trim() : ''))
+      .filter(Boolean)
+      .join(' ') || staffData.email;
+
+    // Generate new access token
+    const tokenPayload = {
+      id: staffData.id,
+      email: staffData.email,
+      role: staffData.role,
+      name: fullName
+    };
+
+    const newToken = jwt.sign(tokenPayload, env.JWT_SECRET, {
+      expiresIn: '24h',
+      issuer: 'ashwini-hospital-backend'
+    });
+
+    // Generate new refresh token
+    const newRefreshTokenPayload = {
+      id: staffData.id,
+      type: 'refresh'
+    };
+    const newRefreshToken = jwt.sign(newRefreshTokenPayload, env.JWT_SECRET, {
+      expiresIn: '7d',
+      issuer: 'ashwini-hospital-backend'
+    });
+
+    // Update refresh token in database
+    const newRefreshTokenExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+    await supabase
+      .from('staff')
+      .update({
+        refresh_token: newRefreshToken,
+        refresh_token_expires_at: newRefreshTokenExpiresAt.toISOString()
+      })
+      .eq('id', staffData.id);
+
+    logger.info('Token refreshed successfully', {
+      staffId: staffData.id,
+      email: staffData.email
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        user: {
+          id: staffData.id,
+          email: staffData.email,
+          role: staffData.role,
+          name: fullName,
+          department: staffData.department,
+          staff_id: staffData.id
+        },
+        token: newToken,
+        refreshToken: newRefreshToken
+      }
+    });
+  } catch (error: any) {
+    if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+      throw createError('Invalid or expired refresh token', 401);
+    }
+    throw error;
+  }
+}));
+
 // Logout endpoint
 router.post('/logout', authenticateToken, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const authHeader = req.headers.authorization;
   const token = authHeader && authHeader.split(' ')[1];
+
+  // Clear refresh token from database
+  const staffId = req.user!.staff_id ?? req.user!.id;
+  await supabase
+    .from('staff')
+    .update({
+      refresh_token: null,
+      refresh_token_expires_at: null
+    })
+    .eq('id', staffId);
 
   if (token) {
     await supabase.auth.admin.signOut(token);
