@@ -377,8 +377,9 @@ router.put('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequ
     throw createError('Failed to update admission', 500);
   }
 
-  // Handle room status updates when admission is discharged/cancelled
+  // Handle room and bed status updates when admission is discharged/cancelled
   if (data.room_id && (updates.status === 'completed' || updates.status === 'cancelled' || updates.status === 'discharged')) {
+    // Update room status
     const { error: roomUpdateError } = await supabase
       .from('rooms')
       .update({ 
@@ -390,6 +391,106 @@ router.put('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequ
 
     if (roomUpdateError) {
       throw createError('Failed to update room availability', 500);
+    }
+
+    // Update bed status if bed_id exists
+    if (data.bed_id) {
+      const { error: bedUpdateError } = await supabase
+        .from('beds')
+        .update({
+          status: 'available',
+          current_patient_id: null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', data.bed_id);
+
+      if (bedUpdateError) {
+        logger.error('Failed to update bed availability on discharge', { bed_id: data.bed_id, error: bedUpdateError });
+        throw createError('Failed to update bed availability', 500);
+      }
+
+      logger.info('Bed released from patient', {
+        bedId: data.bed_id,
+        patientId: data.patient_id,
+        admissionId: data.id,
+        status: updates.status
+      });
+    }
+
+    // Calculate and add final pro-rated room charge for discharge
+    if (updates.discharge_date && data.admission_date) {
+      const admissionDate = new Date(data.admission_date);
+      const dischargeDate = new Date(updates.discharge_date as string);
+      const diffMs = dischargeDate.getTime() - admissionDate.getTime();
+      const totalHours = Math.ceil(diffMs / (1000 * 60 * 60));
+      const totalDays = Math.ceil(totalHours / 24);
+      
+      // Get room rate
+      const { data: roomData } = await supabase
+        .from('rooms')
+        .select('rate_per_day, room_number, room_type')
+        .eq('id', data.room_id)
+        .maybeSingle();
+      
+      const roomRate = roomData?.rate_per_day || 1500;
+      const finalCharge = totalDays * roomRate;
+      
+      // Check if there's an existing invoice for this admission
+      const { data: existingInvoice } = await supabase
+        .from('invoices')
+        .select('id, admission_id')
+        .eq('admission_id', data.id)
+        .maybeSingle();
+      
+      if (existingInvoice) {
+        // Check if final room charge already exists
+        const { data: existingRoomCharge } = await supabase
+          .from('bill_items')
+          .select('id')
+          .eq('invoice_id', existingInvoice.id)
+          .ilike('item_name', '%Room Charges%')
+          .ilike('description', '%Final%')
+          .maybeSingle();
+        
+        if (!existingRoomCharge && finalCharge > 0) {
+          // Add final room charge to bill
+          const { error: billItemError } = await supabase
+            .from('bill_items')
+            .insert({
+              invoice_id: existingInvoice.id,
+              item_name: `Final Room Charges - ${roomData?.room_type || 'General'} Room`,
+              description: `${totalDays} days @ ${roomRate}/day (Discharged on ${new Date(updates.discharge_date as string).toLocaleDateString()})`,
+              item_type: 'room',
+              quantity: totalDays,
+              unit_price: roomRate,
+              amount: finalCharge,
+              created_at: new Date().toISOString()
+            });
+          
+          if (billItemError) {
+            logger.error('Failed to add final room charge to bill', { 
+              invoiceId: existingInvoice.id, 
+              error: billItemError 
+            });
+          } else {
+            logger.info('Final room charge added to bill', {
+              invoiceId: existingInvoice.id,
+              totalDays,
+              finalCharge
+            });
+          }
+        }
+      }
+      
+      logger.info('Final room charge calculated for discharge', {
+        admissionId: data.id,
+        totalDays,
+        totalHours,
+        roomRate,
+        finalCharge,
+        admissionDate: data.admission_date,
+        dischargeDate: updates.discharge_date
+      });
     }
 
     logger.info('Room released from patient', {
