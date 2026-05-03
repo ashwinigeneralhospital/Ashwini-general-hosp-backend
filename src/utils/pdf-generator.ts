@@ -142,6 +142,39 @@ const drawLetterheadFrame = (
   doc.fillColor(colors.text);
 };
 
+const drawFooter = (
+  doc: PDFKit.PDFDocument,
+  leftX: number,
+  contentWidth: number,
+  pageWidth: number,
+  pageHeight: number,
+): void => {
+  const rightX = pageWidth - 35;
+  
+  // Draw footer lines with darker color for visibility
+  const footerLineY = pageHeight - 50;
+  doc.strokeColor('#1f4e79').lineWidth(0.6);
+  doc.moveTo(leftX, footerLineY).lineTo(rightX, footerLineY).stroke();
+  doc.lineWidth(1.5);
+  doc.moveTo(leftX, footerLineY + 4).lineTo(rightX, footerLineY + 4).stroke();
+  
+  // Draw footer text
+  if (env.HOSPITAL_FOOTER_ADDRESS) {
+    doc.font('Helvetica-Bold').fontSize(8).fillColor('#000000');
+    const footerText = env.HOSPITAL_FOOTER_ADDRESS;
+    const maxFooterWidth = contentWidth - 20;
+    const truncatedFooter = truncateText(doc, footerText, maxFooterWidth, 'Helvetica-Bold', 8);
+    const textWidth = doc.widthOfString(truncatedFooter);
+    const textX = leftX + (contentWidth - textWidth) / 2;
+    
+    doc.text(truncatedFooter, textX, pageHeight - 38, {
+      width: 0,
+      lineBreak: false,
+    });
+    doc.fillColor(colors.text);
+  }
+};
+
 const drawMedicationSection = (
   doc: PDFKit.PDFDocument,
   data: InvoiceData,
@@ -192,7 +225,7 @@ export const generateInvoicePDF = async (data: InvoiceData): Promise<Buffer> => 
     try {
       const doc = new PDFDocument({
         size: 'A4',
-        bufferPages: false,
+        bufferPages: true,
         margins: {
           top: LETTERHEAD_HEADER_HEIGHT + 10,
           bottom: LETTERHEAD_FOOTER_HEIGHT + 10,
@@ -210,31 +243,7 @@ export const generateInvoicePDF = async (data: InvoiceData): Promise<Buffer> => 
       const rightX = pageWidth - doc.page.margins.right;
       const contentWidth = rightX - leftX;
 
-      // Draw letterhead frame on first page
-      drawLetterheadFrame(doc, leftX, contentWidth, doc.page.width, doc.page.height);
-      
-      // Draw footer lines on first page (text removed temporarily to isolate issue)
-      const footerLineY = doc.page.height - 50;
-      doc.strokeColor(LETTERHEAD_LINE_COLOR).lineWidth(0.5);
-      doc.moveTo(leftX, footerLineY).lineTo(rightX, footerLineY).stroke();
-      doc.lineWidth(1);
-      doc.moveTo(leftX, footerLineY + 3).lineTo(rightX, footerLineY + 3).stroke();
-
-      // Reset cursor to start position for content
-      doc.y = LETTERHEAD_HEADER_HEIGHT + 5;
       let cursorY = LETTERHEAD_HEADER_HEIGHT + 5;
-
-      // Use pageAdded event to draw letterhead and footer on subsequent pages
-      doc.on('pageAdded', () => {
-        drawLetterheadFrame(doc, leftX, contentWidth, doc.page.width, doc.page.height);
-        
-        const pH = doc.page.height;
-        const fLineY = pH - 50;
-        doc.strokeColor(LETTERHEAD_LINE_COLOR).lineWidth(0.5);
-        doc.moveTo(leftX, fLineY).lineTo(rightX, fLineY).stroke();
-        doc.lineWidth(1);
-        doc.moveTo(leftX, fLineY + 3).lineTo(rightX, fLineY + 3).stroke();
-      });
 
       // Provisional bill title (kept compact so it fits below the letterhead header)
       doc.font('Helvetica-Bold').fontSize(14).fillColor(colors.accent);
@@ -262,6 +271,18 @@ export const generateInvoicePDF = async (data: InvoiceData): Promise<Buffer> => 
       // Add admission summary page if provided
       if (data.admissionSummary) {
         drawAdmissionSummaryPage(doc, data, leftX, contentWidth, pageWidth);
+      }
+
+      // Draw letterhead frame and footer on all pages after content is laid out
+      const range = doc.bufferedPageRange();
+      for (let i = range.start; i < range.start + range.count; i++) {
+        doc.switchToPage(i);
+        
+        // Draw letterhead frame (header + watermark)
+        drawLetterheadFrame(doc, leftX, contentWidth, doc.page.width, doc.page.height);
+        
+        // Draw footer
+        drawFooter(doc, leftX, contentWidth, doc.page.width, doc.page.height);
       }
 
       doc.on('error', (streamError) => {
@@ -414,7 +435,14 @@ const drawPatientInfoSection = (
   infoY += 15;
   drawInfoField(doc, leftColX, infoY, 'Age / Gender', `${calculateAge(patient.date_of_birth)} / ${formatGender(patient.gender)}`, colWidth - 20);
   infoY += 15;
-  drawInfoField(doc, leftColX, infoY, 'Address', address, colWidth - 20);
+  // Draw address with multi-line support
+  doc.font('Helvetica-Bold').fontSize(8).fillColor(colors.primary).text('Address:', leftColX, infoY);
+  const labelWidth = doc.widthOfString('Address:');
+  const addressWidth = colWidth - 20 - labelWidth - 5;
+  doc.font('Helvetica').fontSize(8).fillColor(colors.text).text(address, leftColX + labelWidth + 5, infoY, {
+    width: addressWidth,
+    lineGap: 2,
+  });
 
   // Right Column
   infoY = startY + 8;
@@ -799,39 +827,6 @@ const drawAdmissionSummaryPage = (
   }
 
   // Footer is rendered by the shared letterhead frame on every page.
-};
-
-const drawFooter = (
-  doc: PDFKit.PDFDocument,
-  data: InvoiceData,
-  leftX: number,
-  contentWidth: number,
-  pageWidth: number,
-): void => {
-  const footerHeight = 40;
-  const bottomMargin = 60;
-  // Try to keep footer on existing page; if content is too close to the bottom,
-  // place the footer just below the current content but clamp within page bounds.
-  let footerY = Math.max(doc.y + 20, doc.page.height - bottomMargin);
-  const maxFooterTop = doc.page.height - (bottomMargin - 10);
-  if (footerY > maxFooterTop) {
-    footerY = maxFooterTop;
-  }
-
-  doc.strokeColor(colors.border).lineWidth(1);
-  doc.moveTo(leftX, footerY).lineTo(pageWidth - 35, footerY).stroke();
-
-  doc.font('Helvetica').fontSize(8).fillColor('#999');
-  const footerText = [
-    'This is a computer generated provisional bill and does not require a signature.',
-    `Generated on: ${formatDateTime(new Date().toISOString())}`,
-  ].join('\n');
-
-  doc.text(footerText, leftX, footerY + 10, {
-    width: contentWidth,
-    align: 'center',
-    lineGap: 4,
-  });
 };
 
 const drawInfoField = (
