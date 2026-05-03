@@ -137,20 +137,20 @@ const drawLetterheadFrame = (
   doc.moveTo(leftX, headerLineY + 4).lineTo(rightX, headerLineY + 4).stroke();
 
   // Footer: double blue lines + centered address (matches image)
-  const footerLineY = pageHeight - 60;
-  doc.strokeColor(LETTERHEAD_LINE_COLOR).lineWidth(0.6);
+  const footerLineY = pageHeight - 50;
+  doc.strokeColor(LETTERHEAD_LINE_COLOR).lineWidth(0.5);
   doc.moveTo(leftX, footerLineY).lineTo(rightX, footerLineY).stroke();
-  doc.lineWidth(1.5);
-  doc.moveTo(leftX, footerLineY + 4).lineTo(rightX, footerLineY + 4).stroke();
+  doc.lineWidth(1);
+  doc.moveTo(leftX, footerLineY + 3).lineTo(rightX, footerLineY + 3).stroke();
 
   doc
     .font('Helvetica-Bold')
-    .fontSize(10)
+    .fontSize(8)
     .fillColor('#000000')
-    .text(env.HOSPITAL_FOOTER_ADDRESS, leftX, pageHeight - 45, {
+    .text(env.HOSPITAL_FOOTER_ADDRESS, leftX, pageHeight - 38, {
       width: contentWidth,
       align: 'center',
-      lineGap: 2,
+      lineGap: 1,
     });
 
   // Reset cursor in case caller relies on doc.y (kept for safety)
@@ -274,24 +274,18 @@ export const generateInvoicePDF = async (data: InvoiceData): Promise<Buffer> => 
       for (let i = range.start; i < range.start + range.count; i++) {
         doc.switchToPage(i);
         
-        // Calculate which pages should have letterhead:
-        // - Page 1 always has the main invoice content
-        // - Page 2 only if admissionSummary was explicitly added
-        // - Any pages beyond expected are overflow pages - skip them
+        // Draw letterhead frame (header + watermark + footer) on all pages
+        // This ensures footer appears at bottom of every page, including overflow pages
         const pageIndex = i - range.start + 1; // 1-based page index
-        const isExpectedPage = pageIndex <= expectedPages;
         const isAdmissionSummaryPage = data.admissionSummary && pageIndex === 2;
         
         logger.info('PDF generation: processing page', {
           pageIndex,
-          isExpectedPage,
           isAdmissionSummaryPage,
-          willDrawLetterhead: isExpectedPage
+          willDrawLetterhead: true
         });
         
-        if (isExpectedPage) {
-          drawLetterheadFrame(doc, leftX, contentWidth, doc.page.width, doc.page.height);
-        }
+        drawLetterheadFrame(doc, leftX, contentWidth, doc.page.width, doc.page.height);
       }
       
       // Log page count for debugging
