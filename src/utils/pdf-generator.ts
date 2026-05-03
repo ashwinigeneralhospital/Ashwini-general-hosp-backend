@@ -136,22 +136,7 @@ const drawLetterheadFrame = (
   doc.lineWidth(0.6);
   doc.moveTo(leftX, headerLineY + 4).lineTo(rightX, headerLineY + 4).stroke();
 
-  // Footer: double blue lines + centered address (matches image)
-  const footerLineY = pageHeight - 50;
-  doc.strokeColor(LETTERHEAD_LINE_COLOR).lineWidth(0.5);
-  doc.moveTo(leftX, footerLineY).lineTo(rightX, footerLineY).stroke();
-  doc.lineWidth(1);
-  doc.moveTo(leftX, footerLineY + 3).lineTo(rightX, footerLineY + 3).stroke();
-
-  doc
-    .font('Helvetica-Bold')
-    .fontSize(8)
-    .fillColor('#000000')
-    .text(env.HOSPITAL_FOOTER_ADDRESS, leftX, pageHeight - 38, {
-      width: contentWidth,
-      align: 'center',
-      lineGap: 1,
-    });
+  // Footer is now drawn by pageAdded event listener to avoid page break issues
 
   // Reset cursor in case caller relies on doc.y (kept for safety)
   doc.fillColor(colors.text);
@@ -207,7 +192,7 @@ export const generateInvoicePDF = async (data: InvoiceData): Promise<Buffer> => 
     try {
       const doc = new PDFDocument({
         size: 'A4',
-        bufferPages: true,
+        bufferPages: false,
         margins: {
           top: LETTERHEAD_HEADER_HEIGHT + 10,
           bottom: LETTERHEAD_FOOTER_HEIGHT + 10,
@@ -225,7 +210,31 @@ export const generateInvoicePDF = async (data: InvoiceData): Promise<Buffer> => 
       const rightX = pageWidth - doc.page.margins.right;
       const contentWidth = rightX - leftX;
 
+      // Draw letterhead frame on first page
+      drawLetterheadFrame(doc, leftX, contentWidth, doc.page.width, doc.page.height);
+      
+      // Draw footer lines on first page (text removed temporarily to isolate issue)
+      const footerLineY = doc.page.height - 50;
+      doc.strokeColor(LETTERHEAD_LINE_COLOR).lineWidth(0.5);
+      doc.moveTo(leftX, footerLineY).lineTo(rightX, footerLineY).stroke();
+      doc.lineWidth(1);
+      doc.moveTo(leftX, footerLineY + 3).lineTo(rightX, footerLineY + 3).stroke();
+
+      // Reset cursor to start position for content
+      doc.y = LETTERHEAD_HEADER_HEIGHT + 5;
       let cursorY = LETTERHEAD_HEADER_HEIGHT + 5;
+
+      // Use pageAdded event to draw letterhead and footer on subsequent pages
+      doc.on('pageAdded', () => {
+        drawLetterheadFrame(doc, leftX, contentWidth, doc.page.width, doc.page.height);
+        
+        const pH = doc.page.height;
+        const fLineY = pH - 50;
+        doc.strokeColor(LETTERHEAD_LINE_COLOR).lineWidth(0.5);
+        doc.moveTo(leftX, fLineY).lineTo(rightX, fLineY).stroke();
+        doc.lineWidth(1);
+        doc.moveTo(leftX, fLineY + 3).lineTo(rightX, fLineY + 3).stroke();
+      });
 
       // Provisional bill title (kept compact so it fits below the letterhead header)
       doc.font('Helvetica-Bold').fontSize(14).fillColor(colors.accent);
@@ -250,51 +259,9 @@ export const generateInvoicePDF = async (data: InvoiceData): Promise<Buffer> => 
       // Totals Section
       cursorY = drawTotalsSectionOptimized(doc, data, leftX, contentWidth, cursorY);
 
-      // Track expected pages before any drawing that might overflow
-      const expectedPages = data.admissionSummary ? 2 : 1;
-
       // Add admission summary page if provided
       if (data.admissionSummary) {
         drawAdmissionSummaryPage(doc, data, leftX, contentWidth, pageWidth);
-      }
-
-      // Render letterhead frame (header + watermark + footer) on every page now
-      // that all content is laid out. Avoids recursive pageAdded by drawing after.
-      const range = doc.bufferedPageRange();
-      const actualPages = range.count;
-      
-      logger.info('PDF generation: page counts', {
-        expectedPages,
-        actualPages,
-        hasAdmissionSummary: !!data.admissionSummary,
-        rangeStart: range.start,
-        rangeCount: range.count
-      });
-      
-      for (let i = range.start; i < range.start + range.count; i++) {
-        doc.switchToPage(i);
-        
-        // Draw letterhead frame (header + watermark + footer) on all pages
-        // This ensures footer appears at bottom of every page, including overflow pages
-        const pageIndex = i - range.start + 1; // 1-based page index
-        const isAdmissionSummaryPage = data.admissionSummary && pageIndex === 2;
-        
-        logger.info('PDF generation: processing page', {
-          pageIndex,
-          isAdmissionSummaryPage,
-          willDrawLetterhead: true
-        });
-        
-        drawLetterheadFrame(doc, leftX, contentWidth, doc.page.width, doc.page.height);
-      }
-      
-      // Log page count for debugging
-      if (actualPages > expectedPages) {
-        logger.info('PDF generation: content overflow created extra pages', {
-          expectedPages,
-          actualPages,
-          overflowPages: actualPages - expectedPages
-        });
       }
 
       doc.on('error', (streamError) => {
