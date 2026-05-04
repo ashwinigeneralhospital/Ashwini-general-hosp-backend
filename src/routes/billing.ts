@@ -1040,7 +1040,8 @@ router.get("/:id/pdf", authenticateToken, requireBilling, asyncHandler(async (re
   const calculateRoomCharges = (admission: any) => {
     const admissionDate = new Date(admission.admission_date);
     const dischargeDate = admission.discharge_date ? new Date(admission.discharge_date) : new Date();
-    const totalDays = Math.ceil((dischargeDate.getTime() - admissionDate.getTime()) / (1000 * 60 * 60 * 24));
+    // Add 1 to include both admission and discharge dates as full days when discharge date exists
+    const totalDays = Math.ceil((dischargeDate.getTime() - admissionDate.getTime()) / (1000 * 60 * 60 * 24)) + (admission.discharge_date ? 1 : 0);
     
     // Default room rates (can be fetched from database room rates)
     const roomRates = {

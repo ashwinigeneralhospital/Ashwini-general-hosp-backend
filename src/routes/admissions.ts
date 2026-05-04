@@ -423,7 +423,8 @@ router.put('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequ
       const dischargeDate = new Date(updates.discharge_date as string);
       const diffMs = dischargeDate.getTime() - admissionDate.getTime();
       const totalHours = Math.ceil(diffMs / (1000 * 60 * 60));
-      const totalDays = Math.ceil(totalHours / 24);
+      // Add 1 to include both admission and discharge dates as full days
+      const totalDays = Math.ceil(totalHours / 24) + 1;
       
       // Get room rate
       const { data: roomData } = await supabase
