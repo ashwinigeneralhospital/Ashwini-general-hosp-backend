@@ -193,7 +193,13 @@ const drawMedicationSection = (
     return startY;
   }
 
-  doc.moveDown(0.5);
+  // Guard: ensure the section heading fits before drawing
+  const contentBottom = doc.page.height - LETTERHEAD_FOOTER_HEIGHT - 5;
+  if (startY + 15 > contentBottom) {
+    doc.addPage();
+    startY = LETTERHEAD_HEADER_HEIGHT + 5;
+  }
+
   doc.font('Helvetica-Bold').fontSize(11).fillColor(colors.primary).text('MEDICATION CHARGES', leftX, startY);
   startY += 15;
 
@@ -595,6 +601,14 @@ const drawTotalsSectionOptimized = (
   const summaryWidth = 280;
   const summaryX = leftX + contentWidth - summaryWidth;
 
+  // Ensure totals block fits on the current page; if not, start a new page
+  const totalsSectionHeight = 6 * 18 + 30; // 6 rows × 18px + padding
+  const contentBottom = doc.page.height - LETTERHEAD_FOOTER_HEIGHT - 5;
+  if (startY + totalsSectionHeight > contentBottom) {
+    doc.addPage();
+    startY = LETTERHEAD_HEADER_HEIGHT + 5;
+  }
+
   // Calculate totals from bill items to ensure accuracy
   const calculatedSubtotal = data.billItems.reduce((sum, item) => sum + Number(item.amount || item.total_price || 0), 0);
   const subtotal = Number(data.invoice.total_amount || calculatedSubtotal || 0);
@@ -679,6 +693,29 @@ interface TableRenderOptions {
   rowFontSize?: number;
 }
 
+const drawTableHeader = (
+  doc: PDFKit.PDFDocument,
+  columns: TableColumn[],
+  startX: number,
+  startY: number,
+  tableWidth: number,
+  headerHeight: number,
+  headerFontSize: number,
+): void => {
+  doc.rect(startX, startY, tableWidth, headerHeight).fill(colors.primary);
+  doc.strokeColor(colors.primary).lineWidth(1);
+  doc.rect(startX, startY, tableWidth, headerHeight).stroke();
+  doc.font('Helvetica-Bold').fontSize(headerFontSize).fillColor('#fff');
+  let currentX = startX;
+  columns.forEach((col) => {
+    doc.text(col.label, currentX + 5, startY + 6, {
+      width: col.width - 10,
+      align: col.align || 'left',
+    });
+    currentX += col.width;
+  });
+};
+
 const drawTable = (
   doc: PDFKit.PDFDocument,
   columns: TableColumn[],
@@ -694,34 +731,34 @@ const drawTable = (
   const headerFontSize = options.headerFontSize ?? 8.5;
   const rowFontSize = options.rowFontSize ?? 8;
 
-  // Draw header
-  doc.rect(startX, startY, tableWidth, headerHeight)
-    .fill(colors.primary);
+  // Usable vertical space per page (between letterhead header and footer)
+  const pageHeight = doc.page.height;
+  const contentTop = LETTERHEAD_HEADER_HEIGHT + 5;
+  const contentBottom = pageHeight - LETTERHEAD_FOOTER_HEIGHT - 5;
 
-  doc.strokeColor(colors.primary).lineWidth(1);
-  doc.rect(startX, startY, tableWidth, headerHeight).stroke();
-
-  doc.font('Helvetica-Bold').fontSize(headerFontSize).fillColor('#fff');
-  let currentX = startX;
-  columns.forEach((col) => {
-    doc.text(col.label, currentX + 5, startY + 6, {
-      width: col.width - 10,
-      align: col.align || 'left',
-    });
-    currentX += col.width;
-  });
-
+  // Draw header on first page
+  drawTableHeader(doc, columns, startX, startY, tableWidth, headerHeight, headerFontSize);
   let currentY = startY + headerHeight;
+
   doc.font('Helvetica').fontSize(rowFontSize).fillColor(colors.text);
 
-  // Draw rows
   rows.forEach((row, idx) => {
+    // Check if the next row would overflow the usable area — if so, add a new page
+    if (currentY + rowHeight > contentBottom) {
+      doc.addPage();
+      currentY = contentTop;
+      // Redraw the table header on the new page so columns are labelled
+      drawTableHeader(doc, columns, startX, currentY, tableWidth, headerHeight, headerFontSize);
+      currentY += headerHeight;
+      doc.font('Helvetica').fontSize(rowFontSize).fillColor(colors.text);
+    }
+
     const bgColor = variant === 'light' && idx % 2 === 0 ? colors.lightBg : '#fff';
     doc.rect(startX, currentY, tableWidth, rowHeight).fill(bgColor);
     doc.strokeColor(colors.border).lineWidth(0.5);
     doc.rect(startX, currentY, tableWidth, rowHeight).stroke();
 
-    // Reset text style after background fill (PDFKit keeps fill color from .fill())
+    // Reset text style after background fill
     doc.font('Helvetica').fontSize(rowFontSize).fillColor(colors.text);
 
     let x = startX;
@@ -729,8 +766,7 @@ const drawTable = (
       const col = columns[index];
       const text = cell || '';
       const maxWidth = col.width - 10;
-
-      const truncated = truncateText(doc, text, maxWidth, 'Helvetica', 8);
+      const truncated = truncateText(doc, text, maxWidth, 'Helvetica', rowFontSize);
       doc.text(truncated, x + 5, currentY + 3, {
         width: maxWidth,
         align: col.align || 'left',

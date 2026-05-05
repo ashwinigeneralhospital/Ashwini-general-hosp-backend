@@ -335,9 +335,9 @@ router.put('/:id', authenticateToken, asyncHandler(async (req: AuthenticatedRequ
     updates.duration = duration;
   }
 
-  if (discharge_date) {
-    updates.discharge_date = new Date(discharge_date).toISOString();
-  } else if (status && ['completed', 'cancelled', 'discharged'].includes(status.toLowerCase())) {
+  if (discharge_date !== undefined) {
+    updates.discharge_date = discharge_date ? new Date(discharge_date).toISOString() : null;
+  } else if (status && ['completed', 'cancelled', 'discharged'].includes(status.toLowerCase()) && !('discharge_date' in req.body)) {
     updates.discharge_date = new Date().toISOString();
   }
 
